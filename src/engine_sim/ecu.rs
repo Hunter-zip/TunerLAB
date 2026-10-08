@@ -376,7 +376,8 @@ impl Ecu {
             // Engine stopped: once the manifold has refilled through the throttle and idle
             // valve, the MAP sensor reads barometric pressure.
             self.stopped_time += dt;
-            if self.stopped_time > BARO_LEARN_STOPPED_S {
+            // Only settled, plausible readings (sea level to ≈ 4500 m) are accepted.
+            if self.stopped_time > BARO_LEARN_STOPPED_S && (55.0..=110.0).contains(&s.map_kpa) {
                 self.baro_kpa = approach(self.baro_kpa, s.map_kpa, dt, 0.2);
             }
         } else {
