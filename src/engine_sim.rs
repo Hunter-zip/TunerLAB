@@ -20,8 +20,10 @@
 //!
 //! [`EngineSim::tick`] performs no heap allocation, no locking and no I/O. All per-cylinder
 //! storage is statically sized ([`MAX_CYLINDERS`]); event logs are fixed-size rings.
-//! Variable frame times are absorbed by a fixed-step accumulator, so results are
-//! deterministic for a given seed and input sequence regardless of the caller's frame rate.
+//! Variable frame times are absorbed by a fixed-step accumulator, so physics, ECU, damage,
+//! warnings and the event log are deterministic for a given seed and input sequence
+//! regardless of the caller's frame rate; only the [`Telemetry`] snapshot is taken per
+//! [`EngineSim::tick`].
 
 mod airpath;
 mod breathing;
@@ -53,7 +55,7 @@ use dtc::DtcSet;
 use ecu::{Ecu, EcuMode};
 use events::{CylinderEvent, CylinderEventRing, EventKind, EventLog};
 use faults::{Fault, FaultError, FaultId, FaultState};
-use i18n::{Language, Localize};
+use i18n::{Language, Localize, MessageKey};
 use math::{Pcg32, RAD_S_TO_RPM};
 use plant::Plant;
 use sensors::SensorState;
@@ -77,8 +79,8 @@ pub const MAX_TICK_S: f32 = 0.25;
 const HIGH_EGT_C: f32 = 980.0;
 /// Warning margin below the turbine inlet temperature limit on turbo engines \[K\].
 const TURBINE_EGT_MARGIN_K: f32 = 50.0;
-/// Catalyst temperature warning threshold, 50 K below substrate damage \[K\].
-const CATALYST_WARNING_K: f32 = 1200.0;
+/// Catalyst warning margin below the substrate melting temperature \[K\].
+const CATALYST_WARNING_MARGIN_K: f32 = 50.0;
 
 /// Refresh period of the MBT estimate in telemetry \[s\].
 const MBT_REFRESH_S: f64 = 0.1;
@@ -197,6 +199,7 @@ impl EngineSim {
             mbt_cache_deg: 0.0,
             mbt_cache_time: f64::NEG_INFINITY,
         };
+        sim.update_warnings();
         sim.refresh_telemetry();
         Ok(sim)
     }
@@ -247,6 +250,12 @@ impl EngineSim {
             .step(&cmd, &ctl, &self.faults, &modifiers, &mut self.rng, dt);
 
         let omega = self.plant.crank.omega;
+        // Delays from the cycle computation (start of compression, BDC) to firing TDC and
+        // to exhaust valve opening, for audio scheduling.
+        let omega_ev = omega.max(1.0);
+        let time_to_tdc = core::f32::consts::PI / omega_ev;
+        let evo_atdc = (180.0 - self.spec.valves.evo_bbdc_deg).to_radians();
+        let time_to_evo = (core::f32::consts::PI + evo_atdc) / omega_ev;
         for c in 0..n {
             if !self.plant.fired[c] {
                 continue;
@@ -264,6 +273,8 @@ impl EngineSim {
             self.cylinder_events.push(CylinderEvent {
                 seq: 0,
                 time_s: now,
+                time_to_tdc_s: time_to_tdc,
+                time_to_evo_s: time_to_evo,
                 cylinder: c as u8,
                 rpm: omega * RAD_S_TO_RPM,
                 peak_pressure_bar: r.peak_pressure_pa * 1.0e-5,
@@ -310,6 +321,16 @@ impl EngineSim {
             self.log.push(now, EventKind::ConditionChanged(condition));
         }
         self.time_s += f64::from(dt);
+        self.update_warnings();
+    }
+
+    /// Re-evaluates the instructor warnings and logs the ones that just became active.
+    fn update_warnings(&mut self) {
+        let warnings = self.evaluate_warnings();
+        for w in warnings.newly_set(self.warnings).iter() {
+            self.log.push(self.time_s, EventKind::Warning(w));
+        }
+        self.warnings = warnings;
     }
 
     fn evaluate_condition(&self) -> EngineCondition {
@@ -356,9 +377,12 @@ impl EngineSim {
             Warning::HighOilTemp,
             p.thermal.t_oil > ZERO_CELSIUS_K + 135.0,
         );
+        // Not during commanded fuel cuts, whose film-only cycles are lean by design.
+        let fuel_cut = self.ecu.rev_cut || self.ecu.dfco || self.ecu.overboost_cut;
         w.set(
             Warning::LeanUnderLoad,
             running
+                && !fuel_cut
                 && p.exhaust_lambda > 1.05
                 && p.air.p_man > 0.8 * self.controls.ambient.pressure_pa
                 && rpm > 1500.0,
@@ -378,10 +402,8 @@ impl EngineSim {
                 .any(|t| *t > lim.piston_crown_limit_k),
         );
         if let Some(t) = &self.spec.turbo {
-            w.set(
-                Warning::Overboost,
-                p.air.p_man * 1.0e-3 > self.calibration.boost.overboost_limit_kpa,
-            );
+            // Hardware limit, not the (student-editable) ECU fuel-cut threshold.
+            w.set(Warning::Overboost, p.air.p_man > t.max_manifold_pressure_pa);
             w.set(Warning::CompressorSurge, p.air.compressor_surge);
             w.set(
                 Warning::TurboOverspeed,
@@ -395,19 +417,14 @@ impl EngineSim {
         );
         w.set(
             Warning::CatalystOverheat,
-            p.thermal.t_catalyst > CATALYST_WARNING_K,
+            p.thermal.t_catalyst > lim.catalyst_melt_k - CATALYST_WARNING_MARGIN_K,
         );
         w.set(Warning::CheckEngine, !self.ecu.dtcs.is_empty());
         w
     }
 
     fn refresh_telemetry(&mut self) {
-        let warnings = self.evaluate_warnings();
-        for w in warnings.newly_set(self.warnings).iter() {
-            self.log.push(self.time_s, EventKind::Warning(w));
-        }
-        self.warnings = warnings;
-
+        let warnings = self.warnings;
         let p = &self.plant;
         let e = &self.ecu;
         let n = self.spec.geometry.cylinders;
@@ -518,10 +535,29 @@ impl EngineSim {
     }
 
     /// Flashes a new calibration (validated; rejected calibrations leave the ECU untouched).
+    ///
+    /// When anything that sets the base fuel quantity changes (engine constants, VE or λ
+    /// tables, injector data, temperature model, enrichments, wall-film model), the learned
+    /// fuel trims are discarded: they corrected the *old* tables and would otherwise
+    /// distort the first drive on the new ones, as a real reflash clears adaptive memory.
     pub fn set_calibration(&mut self, calibration: Calibration) -> Result<(), SimError> {
         calibration.validate()?;
         if calibration.engine.cylinders != self.spec.geometry.cylinders {
             return Err(SimError::CylinderMismatch);
+        }
+        let old = &self.calibration;
+        let fuel_changed = old.engine != calibration.engine
+            || old.ve != calibration.ve
+            || old.lambda_target != calibration.lambda_target
+            || old.injector != calibration.injector
+            || old.charge_temp_blend != calibration.charge_temp_blend
+            || old.warmup_enrichment != calibration.warmup_enrichment
+            || old.after_start_enrichment != calibration.after_start_enrichment
+            || old.after_start_decay_s != calibration.after_start_decay_s
+            || old.wall_film_fraction != calibration.wall_film_fraction
+            || old.wall_film_tau_s != calibration.wall_film_tau_s;
+        if fuel_changed {
+            self.ecu.reset_fuel_trims();
         }
         self.calibration = calibration;
         Ok(())
@@ -554,20 +590,31 @@ impl EngineSim {
         &self.ecu.dtcs
     }
 
-    /// Clears stored trouble codes and learned fuel trims (scan-tool function).
+    /// Clears stored trouble codes, OBD monitor progress and learned fuel trims (scan-tool
+    /// function).
     pub fn clear_dtcs(&mut self) {
         self.ecu.clear_codes();
+        self.update_warnings();
+        self.refresh_telemetry();
     }
 
-    /// Injects a hidden fault (Engine Autopsy).
+    /// Injects a hidden fault (Engine Autopsy). Rejected when a parameter is out of range
+    /// or too mild to have any effect, or when the engine lacks the hardware (turbo faults
+    /// on a naturally aspirated engine).
     pub fn inject_fault(&mut self, fault: Fault) -> Result<(), SimError> {
-        self.faults.apply(fault, self.spec.geometry.cylinders)?;
+        self.faults.apply(
+            fault,
+            self.spec.geometry.cylinders,
+            self.spec.turbo.is_some(),
+        )?;
+        self.refresh_telemetry();
         Ok(())
     }
 
     /// Removes all injected faults.
     pub fn clear_faults(&mut self) {
         self.faults = FaultState::default();
+        self.refresh_telemetry();
     }
 
     /// Whether a fault of the given kind is active (answer checking).
@@ -581,19 +628,30 @@ impl EngineSim {
         if self.damage.fatal.is_none() {
             self.plant.prewarm(self.controls.ambient.temperature_k);
             self.sensors.settle(&self.plant, &self.faults);
+            self.update_warnings();
+            self.refresh_telemetry();
         }
     }
 
-    /// Replaces every damaged component and refills the coolant ("rebuild").
+    /// Replaces every damaged component and refills the coolant ("rebuild"). A running
+    /// engine keeps running; a destroyed one is rebuilt at standstill, ready to restart.
     pub fn repair(&mut self) {
+        let was_destroyed = self.damage.fatal.is_some();
         self.damage = DamageState::default();
         self.plant.thermal.coolant_level = 1.0;
-        self.plant.crank.omega = 0.0;
+        if was_destroyed {
+            self.plant.stop_crank();
+        }
         self.knock_hold = [0.0; MAX_CYLINDERS];
         self.misfire_hold = 0.0;
-        self.condition = self.evaluate_condition();
-        self.log
-            .push(self.time_s, EventKind::ConditionChanged(self.condition));
+        let condition = self.evaluate_condition();
+        if condition != self.condition {
+            self.condition = condition;
+            self.log
+                .push(self.time_s, EventKind::ConditionChanged(condition));
+        }
+        self.update_warnings();
+        self.refresh_telemetry();
     }
 
     /// Cold-soaks the stopped engine: every thermal mass and sensor settles at the current
@@ -615,11 +673,15 @@ impl EngineSim {
         self.plant.exhaust_port_temp = t;
         self.sensors.settle(&self.plant, &self.faults);
         self.sensors.readings.egt_c = t - ZERO_CELSIUS_K;
+        self.update_warnings();
+        self.refresh_telemetry();
     }
 
     /// Restarts the simulation from a cold engine with ignition off, keeping engine,
-    /// calibration, seed and ambient conditions. Faults, damage, logs and all other
-    /// controls are reset.
+    /// calibration, seed and ambient conditions. Faults, damage, all other controls and the
+    /// ECU (including stored trouble codes and learned fuel trims) are reset. Retained
+    /// events are discarded, but event sequence numbers keep counting, so cursors held for
+    /// [`EventLog::since`] stay valid.
     pub fn reset(&mut self) {
         let ambient = self.controls.ambient;
         self.controls = Controls {
@@ -643,6 +705,7 @@ impl EngineSim {
         self.fired_prev = [false; MAX_CYLINDERS];
         self.mbt_cache_deg = 0.0;
         self.mbt_cache_time = f64::NEG_INFINITY;
+        self.update_warnings();
         self.refresh_telemetry();
     }
 
@@ -656,11 +719,18 @@ impl EngineSim {
         self.condition
     }
 
-    /// Localised one-line engine status (failure cause when failed).
-    pub fn status_text(&self, lang: Language) -> &'static str {
+    /// Message key of the one-line engine status (the failure cause when failed), for
+    /// rendering through any [`i18n::Localizer`].
+    pub fn status_key(&self) -> MessageKey {
         match self.condition {
-            EngineCondition::Failed(cause) => cause.localized(lang),
-            c => c.localized(lang),
+            EngineCondition::Failed(cause) => MessageKey::Failure(cause),
+            c => MessageKey::Condition(c),
         }
+    }
+
+    /// Localised one-line engine status from the built-in tables (failure cause when
+    /// failed).
+    pub fn status_text(&self, lang: Language) -> &'static str {
+        self.status_key().localized(lang)
     }
 }

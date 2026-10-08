@@ -76,6 +76,13 @@ const AFTERBURN_FRACTION: f32 = 0.7;
 /// during deceleration fuel cut-off) rather than a misfire.
 const MISFIRE_LAMBDA_LIMIT: f32 = 2.5;
 
+/// Heat-flux amplification on the piston crown per bar of knock intensity, capped at
+/// [`KNOCK_HEAT_GAIN_MAX`]: detonation pressure waves scrub the thermal boundary layer, and
+/// measured crown heat flux rises 2–4× in heavy knock (Heywood §9.6.1).
+const KNOCK_HEAT_GAIN_PER_BAR: f32 = 0.6;
+/// Upper bound of the knock heat-flux amplification.
+const KNOCK_HEAT_GAIN_MAX: f32 = 4.0;
+
 /// Extra polytropic index on the expansion of a motored (non-fired) cycle, accounting for
 /// heat loss and blow-by so that motoring work is net negative as on a motoring dyno.
 const MOTORING_EXPANSION_PENALTY: f32 = 0.04;
@@ -131,7 +138,10 @@ pub(crate) struct CycleResult {
     pub net_work_j: f32,
     pub fuel_energy_j: f32,
     pub heat_released_j: f32,
+    /// Total in-cylinder heat transfer to the walls, including [`Self::knock_wall_heat_j`] \[J\].
     pub wall_heat_j: f32,
+    /// Extra piston-crown heat caused by knock (part of `wall_heat_j`) \[J\].
+    pub knock_wall_heat_j: f32,
     pub afterburn_j: f32,
     pub unburned_fuel_energy_j: f32,
     pub unused_air_kg: f32,
@@ -163,6 +173,7 @@ pub(crate) struct CombustionModel {
     stroke: f32,
     woschni_prefactor: f32,
     knock_resistance: f32,
+    piston_heat_share: f32,
     n_c: f32,
     stoich_afr: f32,
     lhv: f32,
@@ -258,6 +269,7 @@ impl CombustionModel {
                 * c.heat_transfer_scale
                 * spec.geometry.bore_m.powf(-0.2),
             knock_resistance: c.knock_resistance,
+            piston_heat_share: clampf(spec.thermal.piston_heat_share, 0.0, 1.0),
             n_c: c.compression_index,
             stoich_afr: spec.fuel.stoich_afr,
             lhv: spec.fuel.lower_heating_value,
@@ -459,7 +471,10 @@ impl CombustionModel {
         let mut knock_integral = 0.0_f32;
         let mut knock_found = false;
         let mut wall_heat = 0.0_f32;
-        let mut gamma_last = n_c;
+        let mut knock_wall_heat = 0.0_f32;
+        // Crown heat-flux multiplier, raised from 1 once the end gas has autoignited.
+        let mut knock_heat_gain = 1.0_f32;
+        let mut gamma_last = burned_gamma(p_a * v_a / (m * R_CHARGE), lambda);
         for k in 0..CYCLE_STEPS {
             let theta1 = theta_a + step * (k + 1) as f32;
             let theta_mid = theta1 - 0.5 * step;
@@ -481,12 +496,18 @@ impl CombustionModel {
                 * w.max(0.1).powf(0.8);
             let area = 2.0 * self.geom.piston_area
                 + core::f32::consts::PI * self.bore * (v / self.geom.piston_area);
-            let dq_wall = h * area * (t_gas - wall_temp) * step * s_per_deg;
+            let dq_base = h * area * (t_gas - wall_temp) * step * s_per_deg;
+            let dq_knock = dq_base.max(0.0) * self.piston_heat_share * (knock_heat_gain - 1.0);
+            let dq_wall = dq_base + dq_knock;
             wall_heat += dq_wall;
+            knock_wall_heat += dq_knock;
 
-            // Charge γ moves from the unburned compression index to the burned value as
-            // the mass fraction burned increases.
-            let gamma = n_c + (burned_gamma(t_gas, lambda) - n_c) * xb_mid;
+            // Single-zone γ(T) of the whole charge (Brunt's correlation is fitted for exactly
+            // this use, compression through expansion). Blending from the polytropic index
+            // n_c by mass fraction burned would double-count the compression heat loss that
+            // Woschni now models explicitly, and a γ that jumps with x_b rather than with
+            // state changes the internal energy pV/(γ−1) without any heat being added.
+            let gamma = burned_gamma(t_gas, lambda);
             gamma_last = gamma;
             // Operator splitting of dp = −γ·p·dV/V + (γ−1)·(dQ_comb − dQ_wall)/V: exact
             // isentropic volume change followed by constant-volume net heat addition.
@@ -516,6 +537,8 @@ impl CombustionModel {
                     knock_found = true;
                     out.knock_onset_deg = theta_mid;
                     out.knock_intensity = KNOCK_MAPO_GAIN * (1.0 - xb_mid) * p_mid * 1.0e-5;
+                    knock_heat_gain = (1.0 + KNOCK_HEAT_GAIN_PER_BAR * out.knock_intensity)
+                        .min(KNOCK_HEAT_GAIN_MAX);
                 }
             }
             p = p1;
@@ -549,6 +572,7 @@ impl CombustionModel {
         out.net_work_j = w_comp + w_exp;
         out.heat_released_j = released;
         out.wall_heat_j = wall_heat.max(0.0);
+        out.knock_wall_heat_j = clampf(knock_wall_heat, 0.0, out.wall_heat_j);
         out.afterburn_j = afterburn;
         out.unburned_fuel_energy_j = (out.fuel_energy_j - released - afterburn).max(0.0);
         out.unused_air_kg = (air_trapped - consumed_air).max(0.0);

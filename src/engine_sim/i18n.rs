@@ -3,8 +3,14 @@
 //! Every user-facing status, warning, trouble code, failure and fault has a compile-time
 //! translation table: exhaustive `match`es make a missing translation a build error, and
 //! returning `&'static str` keeps lookups allocation-free (safe on the audio thread).
-//! Phase 3 can swap [`StaticLocalizer`] for a Fluent-backed implementation of
-//! [`Localizer`] without touching the simulation.
+//!
+//! The simulation reports *what* to say as [`MessageKey`]s (e.g.
+//! [`EngineSim::status_key`](super::EngineSim::status_key), warning bits, DTC codes); the
+//! UI decides *how* by passing them to a [`Localizer`]. [`Localizer::text`] returns a
+//! [`Cow`], so a Phase 3 Fluent-backed implementation can return strings formatted at run
+//! time while [`StaticLocalizer`] keeps borrowing the static tables.
+
+use std::borrow::Cow;
 
 use super::dtc::DtcCode;
 use super::faults::FaultId;
@@ -69,9 +75,10 @@ pub trait Localize {
 pub trait Localizer {
     /// Active language.
     fn language(&self) -> Language;
-    /// Text for `key` in the active language.
-    fn text(&self, key: MessageKey) -> &'static str {
-        text(key, self.language())
+    /// Text for `key` in the active language. The default borrows the built-in tables;
+    /// implementations backed by run-time resources may return owned or borrowed text.
+    fn text(&self, key: MessageKey) -> Cow<'_, str> {
+        Cow::Borrowed(text(key, self.language()))
     }
 }
 
@@ -194,7 +201,7 @@ impl Localize for Warning {
             Self::ValveFloat => pick(
                 lang,
                 "Valve float",
-                "Pływanie zaworów (utrata kontroli sprężyn)",
+                "Zawisanie zaworów (utrata kontroli sprężyn)",
             ),
             Self::Overheat => pick(lang, "Engine overheating", "Przegrzanie silnika"),
             Self::CoolantBoiling => pick(lang, "Coolant boiling", "Wrzenie płynu chłodzącego"),
@@ -215,7 +222,7 @@ impl Localize for Warning {
                 pick(lang, "Piston crown overheating", "Przegrzanie denka tłoka")
             }
             Self::Overboost => pick(lang, "Overboost", "Przekroczone ciśnienie doładowania"),
-            Self::CompressorSurge => pick(lang, "Compressor surge", "Pompowanie sprężarki"),
+            Self::CompressorSurge => pick(lang, "Compressor surge", "Pompaż sprężarki"),
             Self::TurboOverspeed => pick(
                 lang,
                 "Turbocharger overspeed",
@@ -435,17 +442,51 @@ mod tests {
 
     #[test]
     fn every_message_is_translated_and_distinct() {
-        let mut keys: Vec<MessageKey> = Vec::new();
-        keys.extend(Warning::ALL.iter().map(|w| MessageKey::Warning(*w)));
-        keys.extend(DtcCode::ALL.iter().map(|d| MessageKey::Dtc(*d)));
-        keys.extend(FaultId::ALL.iter().map(|f| MessageKey::Fault(*f)));
-        keys.push(MessageKey::Condition(EngineCondition::Running));
-        keys.push(MessageKey::Failure(FailureCause::SpunBearing));
-        for k in keys {
-            let en = text(k, Language::En);
-            let pl = text(k, Language::Pl);
-            assert!(!en.is_empty() && !pl.is_empty());
-            assert_ne!(en, pl, "{k:?} untranslated");
+        let failures = [
+            FailureCause::ThrownRod { cylinder: 0 },
+            FailureCause::BentRod { cylinder: 0 },
+            FailureCause::SpunBearing,
+            FailureCause::HoledPiston { cylinder: 0 },
+            FailureCause::MeltedPiston { cylinder: 0 },
+            FailureCause::BentValve { cylinder: 0 },
+            FailureCause::HeadGasket { cylinder: 0 },
+            FailureCause::WarpedHead,
+            FailureCause::TurboFailure,
+            FailureCause::CatalystMeltdown,
+        ];
+        let conditions = [
+            EngineCondition::Off,
+            EngineCondition::Cranking,
+            EngineCondition::Running,
+            EngineCondition::Stalled,
+            EngineCondition::Failed(FailureCause::SpunBearing),
+        ];
+        let groups: [Vec<MessageKey>; 5] = [
+            Warning::ALL
+                .iter()
+                .map(|w| MessageKey::Warning(*w))
+                .collect(),
+            DtcCode::ALL.iter().map(|d| MessageKey::Dtc(*d)).collect(),
+            FaultId::ALL.iter().map(|f| MessageKey::Fault(*f)).collect(),
+            conditions
+                .iter()
+                .map(|c| MessageKey::Condition(*c))
+                .collect(),
+            failures.iter().map(|f| MessageKey::Failure(*f)).collect(),
+        ];
+        for keys in &groups {
+            for (i, k) in keys.iter().enumerate() {
+                let en = text(*k, Language::En);
+                let pl = text(*k, Language::Pl);
+                assert!(!en.is_empty() && !pl.is_empty());
+                assert_ne!(en, pl, "{k:?} untranslated");
+                // Within a category every message must be distinguishable.
+                for other in &keys[i + 1..] {
+                    for lang in Language::ALL {
+                        assert_ne!(text(*k, lang), text(*other, lang), "{k:?} vs {other:?}");
+                    }
+                }
+            }
         }
     }
 

@@ -67,8 +67,17 @@ fn locate<const N: usize>(axis: &[f32; N], x: f32) -> (usize, f32) {
     (i, clampf(t, 0.0, 1.0))
 }
 
+/// Largest axis magnitude accepted (rpm, kPa, °C, V, % all stay far below it); keeps the
+/// breakpoint spans finite.
+const AXIS_LIMIT: f32 = 1.0e6;
+
 fn axis_valid<const N: usize>(axis: &[f32; N]) -> bool {
-    axis.iter().all(|v| v.is_finite()) && axis.windows(2).all(|w| w[1] > w[0])
+    axis.iter().all(|v| v.is_finite() && v.abs() <= AXIS_LIMIT)
+        && axis.windows(2).all(|w| w[1] > w[0])
+}
+
+fn all_within<'a>(mut values: impl Iterator<Item = &'a f32>, lo: f32, hi: f32) -> bool {
+    values.all(|v| v.is_finite() && *v >= lo && *v <= hi)
 }
 
 /// One-dimensional calibration curve with linear interpolation.
@@ -95,8 +104,16 @@ impl<const N: usize> Table1D<N> {
         lerp(self.values[i], self.values[i + 1], t)
     }
 
-    fn is_valid(&self) -> bool {
-        N >= 1 && axis_valid(&self.axis) && self.values.iter().all(|v| v.is_finite())
+    fn axis_valid(&self) -> bool {
+        N >= 1 && axis_valid(&self.axis)
+    }
+
+    fn axis_within(&self, lo: f32, hi: f32) -> bool {
+        all_within(self.axis.iter(), lo, hi)
+    }
+
+    fn values_within(&self, lo: f32, hi: f32) -> bool {
+        all_within(self.values.iter(), lo, hi)
     }
 }
 
@@ -141,10 +158,12 @@ impl<const X: usize, const Y: usize> Table2D<X, Y> {
         }
     }
 
-    fn is_valid(&self) -> bool {
-        axis_valid(&self.x_axis)
-            && axis_valid(&self.y_axis)
-            && self.values.iter().flatten().all(|v| v.is_finite())
+    fn axes_valid(&self) -> bool {
+        axis_valid(&self.x_axis) && axis_valid(&self.y_axis)
+    }
+
+    fn values_within(&self, lo: f32, hi: f32) -> bool {
+        all_within(self.values.iter().flatten(), lo, hi)
     }
 }
 
@@ -682,13 +701,23 @@ impl Calibration {
         }
     }
 
-    /// Checks every axis and value. A calibration edited in the UI should be validated
-    /// before being flashed with [`EngineSim::set_calibration`](super::EngineSim::set_calibration).
+    /// Checks every axis, table value and scalar against its physical range, plus the
+    /// ordering constraints between related settings. A calibration edited in the UI should
+    /// be validated before being flashed with
+    /// [`EngineSim::set_calibration`](super::EngineSim::set_calibration); the simulation
+    /// never runs on a calibration that fails this check.
     pub fn validate(&self) -> Result<(), CalibrationError> {
         if self.engine.cylinders == 0 || self.engine.cylinders > MAX_CYLINDERS {
             return Err(CalibrationError::InvalidValue("engine.cylinders"));
         }
-        let scalars: [(&'static str, f32, f32, f32); 10] = [
+        let cl = &self.closed_loop;
+        let idle = &self.idle;
+        let k = &self.knock;
+        let lim = &self.limiter;
+        let d = &self.dfco;
+        let b = &self.boost;
+        // (name, value, min, max), inclusive.
+        let scalars: [(&'static str, f32, f32, f32); 41] = [
             (
                 "engine.displacement_cc",
                 self.engine.displacement_cc,
@@ -698,21 +727,67 @@ impl Calibration {
             ("engine.stoich_afr", self.engine.stoich_afr, 5.0, 20.0),
             ("injector.flow_g_s", self.injector.flow_g_s, 0.1, 100.0),
             ("injector.max_duty", self.injector.max_duty, 0.1, 1.0),
-            ("limiter.cut_rpm", self.limiter.cut_rpm, 1000.0, 15_000.0),
+            (
+                "injector.rated_pressure_kpa",
+                self.injector.rated_pressure_kpa,
+                50.0,
+                10_000.0,
+            ),
+            ("cranking_decay_s", self.cranking_decay_s, 0.1, 60.0),
+            ("cranking_spark_deg", self.cranking_spark_deg, -20.0, 40.0),
+            ("after_start_decay_s", self.after_start_decay_s, 0.1, 120.0),
+            ("idle.kp", idle.kp, 0.0, 0.01),
+            ("idle.ki", idle.ki, 0.0, 0.01),
+            ("idle.base_spark_deg", idle.base_spark_deg, -20.0, 50.0),
+            ("idle.spark_gain", idle.spark_gain, 0.0, 1.0),
+            ("idle.spark_limit_deg", idle.spark_limit_deg, 0.0, 30.0),
+            ("idle.window_rpm", idle.window_rpm, 0.0, 3000.0),
+            ("closed_loop.min_coolant_c", cl.min_coolant_c, -40.0, 130.0),
+            ("closed_loop.kp", cl.kp, 0.0, 5.0),
+            ("closed_loop.ki", cl.ki, 0.0, 20.0),
+            ("closed_loop.trim_limit", cl.trim_limit, 0.01, 0.5),
+            ("closed_loop.ltft_rate", cl.ltft_rate, 0.0, 10.0),
+            ("closed_loop.ltft_limit", cl.ltft_limit, 0.01, 0.5),
+            ("closed_loop.lambda_window", cl.lambda_window, 0.001, 1.0),
+            ("knock.retard_step_deg", k.retard_step_deg, 0.0, 20.0),
+            ("knock.max_retard_deg", k.max_retard_deg, 0.0, 30.0),
+            ("knock.recovery_deg_per_s", k.recovery_deg_per_s, 0.0, 100.0),
+            ("limiter.cut_rpm", lim.cut_rpm, 1000.0, 15_000.0),
+            ("limiter.hysteresis_rpm", lim.hysteresis_rpm, 0.0, 3000.0),
+            ("limiter.soft_window_rpm", lim.soft_window_rpm, 0.0, 3000.0),
+            ("limiter.soft_retard_deg", lim.soft_retard_deg, 0.0, 30.0),
+            ("dfco.min_rpm", d.min_rpm, 0.0, 15_000.0),
+            ("dfco.resume_rpm", d.resume_rpm, 0.0, 15_000.0),
+            ("dfco.min_coolant_c", d.min_coolant_c, -40.0, 150.0),
+            ("dfco.delay_s", d.delay_s, 0.0, 30.0),
+            ("fan.on_c", self.fan.on_c, 0.0, 150.0),
+            ("fan.off_c", self.fan.off_c, 0.0, 150.0),
+            ("boost.kp", b.kp, 0.0, 1.0),
+            ("boost.ki", b.ki, 0.0, 10.0),
+            ("boost.kd", b.kd, 0.0, 1.0),
+            (
+                "boost.overboost_limit_kpa",
+                b.overboost_limit_kpa,
+                50.0,
+                500.0,
+            ),
+            (
+                "misfire.threshold_fraction",
+                self.misfire.threshold_fraction,
+                0.01,
+                2.0,
+            ),
             (
                 "misfire.inertia_kg_m2",
                 self.misfire.inertia_kg_m2,
                 0.01,
                 10.0,
             ),
-            ("cranking_spark_deg", self.cranking_spark_deg, -20.0, 40.0),
-            ("after_start_decay_s", self.after_start_decay_s, 0.1, 120.0),
-            ("cranking_decay_s", self.cranking_decay_s, 0.1, 60.0),
             (
-                "boost.overboost_limit_kpa",
-                self.boost.overboost_limit_kpa,
-                50.0,
+                "limiter.hysteresis_rpm",
+                lim.cut_rpm - lim.hysteresis_rpm,
                 500.0,
+                15_000.0,
             ),
         ];
         for (name, v, lo, hi) in scalars {
@@ -720,66 +795,132 @@ impl Calibration {
                 return Err(CalibrationError::InvalidValue(name));
             }
         }
-        let maps: [(&'static str, bool); 3] = [
-            ("ve", self.ve.is_valid()),
-            ("ignition", self.ignition.is_valid()),
-            ("lambda_target", self.lambda_target.is_valid()),
+        // Ordering constraints: DFCO must resume below its entry speed and the fan must
+        // switch off below its switch-on temperature, or the logic would chatter.
+        if d.resume_rpm >= d.min_rpm {
+            return Err(CalibrationError::InvalidValue("dfco.resume_rpm"));
+        }
+        if self.fan.off_c >= self.fan.on_c {
+            return Err(CalibrationError::InvalidValue("fan.off_c"));
+        }
+
+        // Maps: strictly increasing finite axes, and every cell within its physical range
+        // (which also keeps the interpolation arithmetic far from overflow).
+        let maps: [(&'static str, bool, bool); 4] = [
+            ("ve", self.ve.axes_valid(), self.ve.values_within(0.0, 2.0)),
+            (
+                "ignition",
+                self.ignition.axes_valid(),
+                self.ignition.values_within(-30.0, 70.0),
+            ),
+            (
+                "lambda_target",
+                self.lambda_target.axes_valid(),
+                self.lambda_target.values_within(0.5, 1.6),
+            ),
+            (
+                "boost.target_kpa",
+                b.target_kpa.axes_valid(),
+                b.target_kpa.values_within(50.0, 500.0),
+            ),
         ];
-        for (name, ok) in maps {
-            if !ok {
+        for (name, axes_ok, values_ok) in maps {
+            if !axes_ok {
                 return Err(CalibrationError::InvalidAxis(name));
             }
+            if !values_ok {
+                return Err(CalibrationError::InvalidValue(name));
+            }
         }
-        let curves: [(&'static str, bool); 14] = [
+        let curves: [(&'static str, bool, bool); 16] = [
             (
                 "injector.dead_time_ms",
-                self.injector.dead_time_ms.is_valid(),
+                self.injector.dead_time_ms.axis_valid(),
+                self.injector.dead_time_ms.values_within(0.0, 10.0),
             ),
-            ("charge_temp_blend", self.charge_temp_blend.is_valid()),
-            ("warmup_enrichment", self.warmup_enrichment.is_valid()),
+            (
+                "charge_temp_blend",
+                self.charge_temp_blend.axis_valid(),
+                self.charge_temp_blend.values_within(0.0, 1.0),
+            ),
+            (
+                "warmup_enrichment",
+                self.warmup_enrichment.axis_valid(),
+                self.warmup_enrichment.values_within(0.5, 4.0),
+            ),
             (
                 "after_start_enrichment",
-                self.after_start_enrichment.is_valid(),
+                self.after_start_enrichment.axis_valid(),
+                self.after_start_enrichment.values_within(0.0, 3.0),
             ),
-            ("cranking_pulse_ms", self.cranking_pulse_ms.is_valid()),
-            ("wall_film_fraction", self.wall_film_fraction.is_valid()),
-            ("wall_film_tau_s", self.wall_film_tau_s.is_valid()),
-            ("idle_target_rpm", self.idle_target_rpm.is_valid()),
-            ("idle_valve_base", self.idle_valve_base.is_valid()),
-            ("iat_spark_correction", self.iat_spark_correction.is_valid()),
+            (
+                "cranking_pulse_ms",
+                self.cranking_pulse_ms.axis_valid(),
+                self.cranking_pulse_ms.values_within(0.0, 100.0),
+            ),
+            (
+                "wall_film_fraction",
+                self.wall_film_fraction.axis_valid(),
+                self.wall_film_fraction.values_within(0.0, 0.95),
+            ),
+            (
+                "wall_film_tau_s",
+                self.wall_film_tau_s.axis_valid(),
+                self.wall_film_tau_s.values_within(0.01, 30.0),
+            ),
+            (
+                "idle_target_rpm",
+                self.idle_target_rpm.axis_valid(),
+                self.idle_target_rpm.values_within(300.0, 3000.0),
+            ),
+            (
+                "idle_valve_base",
+                self.idle_valve_base.axis_valid(),
+                self.idle_valve_base.values_within(0.0, 1.0),
+            ),
+            (
+                "iat_spark_correction",
+                self.iat_spark_correction.axis_valid(),
+                self.iat_spark_correction.values_within(-20.0, 20.0),
+            ),
             (
                 "coolant_spark_correction",
-                self.coolant_spark_correction.is_valid(),
+                self.coolant_spark_correction.axis_valid(),
+                self.coolant_spark_correction.values_within(-20.0, 20.0),
             ),
-            ("knock.threshold", self.knock.threshold.is_valid()),
-            ("throttle_map", self.throttle_map.is_valid()),
-            ("boost.base_duty", self.boost.base_duty.is_valid()),
+            (
+                "knock.threshold",
+                k.threshold.axis_valid(),
+                k.threshold.values_within(0.01, 100.0),
+            ),
+            (
+                "throttle_map",
+                self.throttle_map.axis_valid(),
+                self.throttle_map.values_within(0.0, 100.0),
+            ),
+            (
+                "boost.base_duty",
+                b.base_duty.axis_valid(),
+                b.base_duty.values_within(0.0, 1.0),
+            ),
+            (
+                "injector.dead_time_ms axis",
+                self.injector.dead_time_ms.axis_within(0.0, 30.0),
+                true,
+            ),
+            (
+                "throttle_map axis",
+                self.throttle_map.axis_within(0.0, 100.0),
+                true,
+            ),
         ];
-        for (name, ok) in curves {
-            if !ok {
+        for (name, axis_ok, values_ok) in curves {
+            if !axis_ok {
                 return Err(CalibrationError::InvalidAxis(name));
             }
-        }
-        if !self.boost.target_kpa.is_valid() {
-            return Err(CalibrationError::InvalidAxis("boost.target_kpa"));
-        }
-        if self
-            .ve
-            .values
-            .iter()
-            .flatten()
-            .any(|v| !(0.0..=2.0).contains(v))
-        {
-            return Err(CalibrationError::InvalidValue("ve"));
-        }
-        if self
-            .lambda_target
-            .values
-            .iter()
-            .flatten()
-            .any(|v| !(0.5..=1.6).contains(v))
-        {
-            return Err(CalibrationError::InvalidValue("lambda_target"));
+            if !values_ok {
+                return Err(CalibrationError::InvalidValue(name));
+            }
         }
         Ok(())
     }
@@ -804,6 +945,44 @@ mod tests {
         assert_eq!(t.lookup(f32::NAN), 0.0);
         let m = Table2D::from_fn([0.0, 1.0], [0.0, 1.0], |x, y| x + 10.0 * y);
         assert!((m.lookup(0.5, 0.5) - 5.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validation_rejects_every_out_of_range_scalar_and_cell() {
+        let base = Calibration::base_for(&EngineSpec::naturally_aspirated_2l());
+        let mut c = base;
+        c.closed_loop.ltft_rate = f32::NAN;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.knock.max_retard_deg = f32::INFINITY;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.limiter.hysteresis_rpm = f32::NAN;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.idle.base_spark_deg = f32::NAN;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.closed_loop.trim_limit = -0.1;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.dfco.resume_rpm = c.dfco.min_rpm + 100.0;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.ignition.values[0][0] = -3.0e38;
+        c.ignition.values[0][1] = 3.0e38;
+        assert!(c.validate().is_err());
+        let mut c = base;
+        c.cranking_pulse_ms.values[0] = 1.0e9;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn interpolation_cannot_overflow_between_finite_cells() {
+        let t = Table1D::new([0.0, 1.0], [-3.0e38, 3.0e38]);
+        assert!(t.lookup(0.0).is_finite());
+        assert!(t.lookup(0.5).is_finite());
+        assert!(t.lookup(1.0).is_finite());
     }
 
     #[test]

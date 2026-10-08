@@ -186,29 +186,47 @@ impl AirPath {
         let leak_cd_a = AUX_DISCHARGE_COEFF * inp.vacuum_leak_area;
 
         // ---- Boost system (pre-throttle volume) --------------------------------------
-        if let Some(turbo) = &self.turbo {
+        // Naturally aspirated engines have no reservoir between filter and throttle: the
+        // filter's quadratic restriction Δp = k·ṁ² acts as an orifice of equivalent area
+        // A_f = 1/√(2·ρ·k) in series with the throttle, combined as for incompressible
+        // flow, 1/A² = 1/A_thr² + 1/A_f² (exact as Δp/p → 0, which is where the filter
+        // matters: at wide-open throttle). Solving the series path inside the implicit
+        // manifold step avoids the explicit filter↔throttle coupling, which at wide-open
+        // throttle has a loop gain above one and would oscillate from step to step.
+        let (p_up, t_up, path_cd_a) = if let Some(turbo) = &self.turbo {
             self.step_compressor_side(st, inp, turbo, cd_a, dt);
+            (st.p_boost, st.t_boost, cd_a)
         } else {
-            // Naturally aspirated: the air filter is a quasi-steady quadratic restriction.
-            let drop = self.filter_k * st.mdot_throttle * st.mdot_throttle;
-            st.p_boost = (p_amb - drop).max(0.5 * p_amb);
-            st.t_boost = t_amb;
-            st.compressor_pr = 1.0;
-            st.mdot_compressor = st.mdot_throttle;
-        }
+            let rho_amb = p_amb / (R_AIR * t_amb);
+            let path = if self.filter_k > 0.0 {
+                let a_f = 1.0 / (2.0 * rho_amb * self.filter_k).sqrt();
+                cd_a * a_f / (cd_a * cd_a + a_f * a_f).sqrt()
+            } else {
+                cd_a
+            };
+            (p_amb, t_amb, path)
+        };
 
         // ---- Intake manifold -----------------------------------------------------------
         let k_cyl = inp.cylinder_flow_coeff.max(0.0);
-        let (p_up, t_up, t_man) = (st.p_boost, st.t_boost, st.t_man);
+        let t_man = st.t_man;
         let c_man = R_AIR * t_man / self.manifold_volume;
         let manifold_rhs = |p: f32| -> f32 {
-            let thr = orifice_flow(cd_a, p_up, t_up, p, t_man, GAMMA_AIR, R_AIR);
+            let thr = orifice_flow(path_cd_a, p_up, t_up, p, t_man, GAMMA_AIR, R_AIR);
             let leak = orifice_flow(leak_cd_a, p_amb, t_amb, p, t_man, GAMMA_AIR, R_AIR);
             c_man * (thr + leak - k_cyl * p)
         };
         st.p_man = implicit_pressure_step(st.p_man, dt, 500.0, 600_000.0, manifold_rhs);
-        st.mdot_throttle = orifice_flow(cd_a, p_up, t_up, st.p_man, t_man, GAMMA_AIR, R_AIR);
+        st.mdot_throttle = orifice_flow(path_cd_a, p_up, t_up, st.p_man, t_man, GAMMA_AIR, R_AIR);
         st.mdot_cyl = k_cyl * st.p_man;
+        if self.turbo.is_none() {
+            // Pressure between filter and throttle, for telemetry.
+            let drop = self.filter_k * st.mdot_throttle * st.mdot_throttle.abs();
+            st.p_boost = clampf(p_amb - drop, 0.5 * p_amb, 1.5 * p_amb);
+            st.t_boost = t_amb;
+            st.compressor_pr = 1.0;
+            st.mdot_compressor = st.mdot_throttle;
+        }
 
         // Manifold air temperature: inflow temperature plus heat soak from the engine,
         // which dominates at low flow (hot idle raises IAT by 5–15 K on real engines).

@@ -12,12 +12,14 @@ use super::dynamics::{self, CrankInputs, CrankState};
 use super::ecu::ActuatorCommands;
 use super::faults::FaultState;
 use super::math::{
-    approach, clampf, finite_or, lag_alpha, smoothstep, wrap_cycle, Pcg32, CYCLE_RAD, RAD_S_TO_RPM,
-    RPM_TO_RAD_S,
+    approach, clampf, finite_or, flush_tiny, lag_alpha, smoothstep, wrap_cycle, Pcg32, CYCLE_RAD,
+    RAD_S_TO_RPM, RPM_TO_RAD_S,
 };
 use super::spec::{CylinderGeometry, EngineSpec, MAX_CYLINDERS};
-use super::thermal::{ThermalInputs, ThermalModel, ThermalState};
-use super::thermo::{vogel_viscosity, water_saturation_pressure, CP_AIR, CP_EXHAUST, R_AIR};
+use super::thermal::{ThermalInputs, ThermalModel, ThermalState, THERMAL_STEP_S};
+use super::thermo::{
+    vogel_viscosity, water_saturation_pressure, CP_AIR, CP_EXHAUST, GAMMA_EXHAUST, R_AIR,
+};
 
 /// Normalisation of the per-stroke torque shape `g(x) = sin x · (1 − x/π)³` on [0, π]:
 /// ∫₀^π g dx = (π² − 6)/π² ≈ 0.392. The shape peaks ≈ 40° from TDC, like the measured
@@ -55,13 +57,16 @@ const COLD_FUEL_TO_OIL: f32 = 0.3;
 const PUMP_STALL_RATIO: f32 = 1.5;
 
 /// Rail pressure (fraction of regulator setting) where the pump curve meets injector
-/// demand. Positive-displacement electric pumps deliver `Q(p) = Q₀·(1 − (p/p_stall)²)`
-/// (internal leakage grows with pressure); injectors draw `D(p) = D_reg·√(p/p_reg)`. When
+/// demand. Positive-displacement electric pumps deliver `Q(x) ∝ 1 − (x/x_stall)²` (internal
+/// leakage grows with pressure), normalised so that `capacity` is the delivery *at
+/// regulator pressure* (x = 1), as pump ratings are quoted; injectors draw
+/// `D(x) = D_reg·√x`. When
 /// the pump can supply more than the demand at regulator pressure, the regulator holds
 /// p_reg; otherwise pressure falls to the intersection, solved here by bisection (16
 /// iterations, < 0.01 % error, allocation-free).
 fn fuel_pump_operating_point(capacity: f32, demand_at_reg: f32) -> f32 {
-    let pump = |x: f32| capacity * (1.0 - (x / PUMP_STALL_RATIO).powi(2));
+    let norm = 1.0 / (1.0 - (1.0 / PUMP_STALL_RATIO).powi(2));
+    let pump = |x: f32| capacity * norm * (1.0 - (x / PUMP_STALL_RATIO).powi(2));
     if pump(1.0) >= demand_at_reg {
         return 1.0;
     }
@@ -155,10 +160,32 @@ pub(crate) struct Plant {
     pub catalyst_efficiency: f32,
     hc_store_j: f32,
     o2_store_kg: f32,
-    wall_heat_accum_j: f32,
     exhaust_mass_accum: f32,
     exhaust_enthalpy_accum: f32,
     fuel_accum: f32,
+    thermal_acc: ThermalAccumulator,
+}
+
+/// Heat and flow integrals collected at the physics rate between two thermal-network
+/// steps (see [`THERMAL_STEP_S`]).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct ThermalAccumulator {
+    /// Elapsed time \[s\].
+    time_s: f32,
+    /// Combustion and exhaust-port heat into the metal \[J\].
+    wall_heat_j: f32,
+    /// Friction work \[J\].
+    friction_j: f32,
+    /// Exhaust-gas heat into the manifold wall \[J\].
+    manifold_j: f32,
+    /// Catalytic exotherm \[J\].
+    exotherm_j: f32,
+    /// Crank angle travelled \[rad\].
+    angle_rad: f32,
+    /// Exhaust mass through the catalyst \[kg\].
+    exhaust_kg: f32,
+    /// Exhaust mass × catalyst inlet temperature \[kg·K\].
+    exhaust_kg_k: f32,
 }
 
 impl Plant {
@@ -226,10 +253,10 @@ impl Plant {
             catalyst_efficiency: 0.0,
             hc_store_j: 0.0,
             o2_store_kg: 0.0,
-            wall_heat_accum_j: 0.0,
             exhaust_mass_accum: 0.0,
             exhaust_enthalpy_accum: 0.0,
             fuel_accum: 0.0,
+            thermal_acc: ThermalAccumulator::default(),
         }
     }
 
@@ -246,6 +273,16 @@ impl Plant {
             return None;
         }
         Some(self.combustion.find_mbt(&inputs))
+    }
+
+    /// Brings the crankshaft and any coupled load (dyno absorber, driveline) to rest.
+    pub(crate) fn stop_crank(&mut self) {
+        let theta = self.crank.theta;
+        self.crank = CrankState {
+            theta,
+            vehicle_speed: self.crank.vehicle_speed,
+            ..CrankState::default()
+        };
     }
 
     /// Puts all thermal masses at fully-warm operating temperature.
@@ -299,10 +336,10 @@ impl Plant {
         let omega0 = self.crank.omega;
         let rpm0 = omega0 * RAD_S_TO_RPM;
 
-        // Water vapour displaces dry air: dry mass fraction ≈ 1 − 0.622·p_v/p
-        // (0.622 = M_water / M_air).
+        // Water vapour displaces dry air: at a given total pressure and temperature the dry
+        // air density falls by the vapour's partial-pressure share (Dalton), 1 − p_v/p.
         let p_vap = amb.relative_humidity * water_saturation_pressure(amb.temperature_k);
-        let dry_fraction = clampf(1.0 - 0.622 * p_vap / amb.pressure_pa, 0.9, 1.0);
+        let dry_fraction = clampf(1.0 - p_vap / amb.pressure_pa, 0.85, 1.0);
         self.valve_float = clampf((rpm0 - self.spec.limits.valve_float_rpm) / 500.0, 0.0, 1.0);
 
         // ---- Breathing ----------------------------------------------------------------
@@ -450,32 +487,45 @@ impl Plant {
         // ---- Thermal ----------------------------------------------------------------------
         let omega = self.crank.omega;
         let rpm = omega * RAD_S_TO_RPM;
-        let ram_air = match &ctl.load {
-            LoadModel::Neutral => 0.0,
-            LoadModel::Dyno(d) => d.cooling_air_speed_m_s,
-            // Grille-to-radiator air speed ≈ 35 % of road speed.
-            LoadModel::Vehicle(_) => 0.35 * self.crank.vehicle_speed,
-        };
-        self.thermal_model.step(
-            &mut self.thermal,
-            &ThermalInputs {
-                wall_heat_j: self.wall_heat_accum_j,
-                friction_power_w: friction * omega,
-                rpm,
+        let acc = &mut self.thermal_acc;
+        acc.time_s += dt;
+        acc.friction_j += friction * omega.max(0.0) * dt;
+        acc.manifold_j += manifold_heat_w * dt;
+        acc.exotherm_j += react;
+        acc.angle_rad += omega.max(0.0) * dt;
+        acc.exhaust_kg += self.exhaust_mass_flow.max(0.0) * dt;
+        acc.exhaust_kg_k += self.exhaust_mass_flow.max(0.0) * self.air.t_post_turbine * dt;
+        if acc.time_s >= THERMAL_STEP_S {
+            let span = acc.time_s;
+            let ram_air = match &ctl.load {
+                LoadModel::Neutral => 0.0,
+                LoadModel::Dyno(d) => d.cooling_air_speed_m_s,
+                // Grille-to-radiator air speed ≈ 35 % of road speed.
+                LoadModel::Vehicle(_) => 0.35 * self.crank.vehicle_speed,
+            };
+            let exhaust_temp = if acc.exhaust_kg > 1.0e-9 {
+                acc.exhaust_kg_k / acc.exhaust_kg
+            } else {
+                self.air.t_post_turbine
+            };
+            let inputs = ThermalInputs {
+                wall_heat_j: acc.wall_heat_j,
+                friction_heat_j: acc.friction_j,
+                rpm: acc.angle_rad / span * RAD_S_TO_RPM,
                 ambient_t: amb.temperature_k,
                 ram_air_speed: ram_air,
                 fan_on: cmd.fan,
                 thermostat_fault: faults.thermostat,
                 coolant_leak_per_s: dmg.coolant_leak_per_s,
-                exhaust_mass_flow: self.exhaust_mass_flow,
-                exhaust_temp: self.air.t_post_turbine,
-                catalyst_exotherm_j: react,
-                manifold_heat_w,
+                exhaust_mass_flow: acc.exhaust_kg / span,
+                exhaust_temp,
+                catalyst_exotherm_j: acc.exotherm_j,
+                manifold_heat_j: acc.manifold_j,
                 cylinders: n,
-            },
-            dt,
-        );
-        self.wall_heat_accum_j = 0.0;
+            };
+            *acc = ThermalAccumulator::default();
+            self.thermal_model.step(&mut self.thermal, &inputs, span);
+        }
 
         // ---- Lubrication ------------------------------------------------------------------
         // Fuel diluting the oil lowers viscosity roughly exponentially with fuel fraction.
@@ -588,6 +638,26 @@ impl Plant {
         self.fuel_mass_flow = finite_or(self.fuel_mass_flow, 0.0);
         self.exhaust_lambda = finite_or(self.exhaust_lambda, 1.0);
         self.exhaust_lambda_apparent = finite_or(self.exhaust_lambda_apparent, 1.0);
+        self.oil_pressure_pa = finite_or(self.oil_pressure_pa, 0.0);
+        self.fuel_rail_pa = finite_or(self.fuel_rail_pa, 0.0);
+        self.peak_pressure_mean_bar = finite_or(self.peak_pressure_mean_bar, 1.0);
+        self.hc_store_j = flush_tiny(finite_or(self.hc_store_j, 0.0));
+        self.o2_store_kg = flush_tiny(finite_or(self.o2_store_kg, 0.0));
+        // Exponentially decaying flows and filters end in subnormals unless flushed.
+        self.exhaust_mass_flow = flush_tiny(self.exhaust_mass_flow);
+        self.exhaust_enthalpy_flow = flush_tiny(self.exhaust_enthalpy_flow);
+        self.fuel_mass_flow = flush_tiny(self.fuel_mass_flow);
+        let tq = &mut self.torque;
+        for v in [
+            &mut tq.gas_instant,
+            &mut tq.indicated_mean,
+            &mut tq.friction,
+            &mut tq.pumping,
+            &mut tq.accessory,
+            &mut tq.brake_mean,
+        ] {
+            *v = flush_tiny(finite_or(*v, 0.0));
+        }
         for c in 0..self.cylinders {
             let cyl = &mut self.cyl[c];
             cyl.film_kg = finite_or(cyl.film_kg, 0.0);
@@ -651,7 +721,10 @@ impl Plant {
             / ((fresh + fuel).max(1.0e-9) * CP_AIR);
         let t_charge = (self.t_fresh - dt_evap).max(200.0);
         let m_res = cyl.residual_kg;
-        let t_res = cyl.residual_temp_k;
+        // The residual left at exhaust pressure expands (part load) or is compressed
+        // (boost) isentropically to manifold pressure as the intake stroke begins.
+        let res_pr = clampf(p_man / self.air.p_exh.max(1.0e3), 0.1, 4.0);
+        let t_res = cyl.residual_temp_k * res_pr.powf((GAMMA_EXHAUST - 1.0) / GAMMA_EXHAUST);
         let t_ivc = (fresh * t_charge + RESIDUAL_CP_RATIO * m_res * t_res)
             / (fresh + RESIDUAL_CP_RATIO * m_res).max(1.0e-12);
 
@@ -705,15 +778,16 @@ impl Plant {
         cyl.trapped_air_kg = fresh;
         self.fired[c] = true;
 
-        // Heat to walls; the piston crown's share is amplified by detonation, whose
-        // pressure waves scrub the thermal boundary layer (heat flux ×2–4 in heavy knock).
+        // Heat to walls: the piston crown takes its geometric share plus all of the extra
+        // flux that detonation drives into it (computed inside the cycle, so it has already
+        // been taken out of the gas).
         let share = self.spec.thermal.piston_heat_share;
-        self.wall_heat_accum_j += r.wall_heat_j * (1.0 - share);
-        let knock_gain = (1.0 + 0.6 * r.knock_intensity).min(4.0);
+        let base = r.wall_heat_j - r.knock_wall_heat_j;
+        self.thermal_acc.wall_heat_j += base * (1.0 - share);
         self.thermal_model.add_piston_heat(
             &mut self.thermal,
             c,
-            r.wall_heat_j * share * knock_gain,
+            base * share + r.knock_wall_heat_j,
         );
 
         // Exhaust port: longer residence at low speed → larger fraction lost to the head.
@@ -726,7 +800,7 @@ impl Plant {
             * r.exhaust_mass_kg
             * CP_EXHAUST
             * (r.exhaust_temp_k - self.thermal.t_metal).max(0.0);
-        self.wall_heat_accum_j += port_heat;
+        self.thermal_acc.wall_heat_j += port_heat;
         let t_port_exit =
             r.exhaust_temp_k - port_heat / (r.exhaust_mass_kg * CP_EXHAUST).max(1.0e-9);
         self.exhaust_mass_accum += r.exhaust_mass_kg;

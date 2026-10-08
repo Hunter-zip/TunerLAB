@@ -31,6 +31,32 @@ const FAILED_HEALTH: f32 = 0.1;
 const VALVE_CONTACT_PROBABILITY: f32 = 0.02;
 /// Coolant lost through a breached head gasket (fraction of fill per second).
 const GASKET_COOLANT_LEAK: f32 = 0.004;
+/// Smallest wear step moved from the f64 accumulator into an f32 health value. Health is
+/// stored in f32 near 1.0, where values are spaced 6·10⁻⁸ apart: per-step wear of slow
+/// mechanisms (≈ 10⁻⁸ per 0.25 ms) would otherwise round to nothing, or to a full ulp.
+const WEAR_QUANTUM: f64 = 1.0e-5;
+
+/// Continuous wear not yet applied to the f32 health values (see [`WEAR_QUANTUM`]).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct PendingWear {
+    piston: [f64; MAX_CYLINDERS],
+    bearings: f64,
+    cylinder_head: f64,
+    head_gasket: f64,
+    turbo: f64,
+    catalyst: f64,
+}
+
+/// Accumulates `amount` of wear and transfers it to `health` in quanta, so the total
+/// applied equals the exact sum to within one quantum regardless of the step size.
+#[inline]
+fn wear(health: &mut f32, pending: &mut f64, amount: f32) {
+    *pending += f64::from(amount.max(0.0));
+    if *pending >= WEAR_QUANTUM {
+        *health -= *pending as f32;
+        *pending = 0.0;
+    }
+}
 
 /// Health of every monitored component (1 = new, 0 = destroyed).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +107,7 @@ pub(crate) struct DamageState {
     pub turbo_failed: bool,
     pub catalyst_failed: bool,
     pub fatal: Option<FailureCause>,
+    pub pending: PendingWear,
 }
 
 /// Physical consequences of damage, consumed by the plant.
@@ -258,8 +285,9 @@ impl DamageModel {
             }
             let t = ctx.t_piston[c];
             let h = &mut st.health.piston[c];
+            let pending = &mut st.pending.piston[c];
             if t > lim.piston_crown_melt_k {
-                *h -= 0.4 * dt;
+                wear(h, pending, 0.4 * dt);
                 if *h < FAILED_HEALTH {
                     *h = 0.0;
                     st.piston_failed[c] = true;
@@ -272,7 +300,7 @@ impl DamageModel {
                 }
             } else if t > lim.piston_crown_limit_k {
                 let x = (t - lim.piston_crown_limit_k) / 50.0;
-                *h -= 0.004 * x * x * dt;
+                wear(h, pending, 0.004 * x * x * dt);
             }
         }
 
@@ -282,12 +310,16 @@ impl DamageModel {
             let required = (lim.bearing_oil_per_krpm * ctx.rpm / 1000.0).max(20_000.0);
             let film = clampf(ctx.oil_pressure_pa / required, 0.0, 1.0);
             let starvation = 1.0 - film;
-            st.health.bearings -= BEARING_WEAR_RATE
-                * starvation
-                * starvation
-                * (ctx.rpm / 1000.0)
-                * (1.0 + ctx.load)
-                * dt;
+            wear(
+                &mut st.health.bearings,
+                &mut st.pending.bearings,
+                BEARING_WEAR_RATE
+                    * starvation
+                    * starvation
+                    * (ctx.rpm / 1000.0)
+                    * (1.0 + ctx.load)
+                    * dt,
+            );
             if st.health.bearings < 0.05 {
                 st.health.bearings = 0.0;
                 Self::fail(st, FailureCause::SpunBearing, log, now);
@@ -298,14 +330,22 @@ impl DamageModel {
         // Cylinder head distortion from overheated metal; a warped head then attacks
         // the gasket.
         if ctx.t_metal > lim.head_warp_k && !st.head_warped {
-            st.health.cylinder_head -= 0.01 * (ctx.t_metal - lim.head_warp_k) / 20.0 * dt;
+            wear(
+                &mut st.health.cylinder_head,
+                &mut st.pending.cylinder_head,
+                0.01 * (ctx.t_metal - lim.head_warp_k) / 20.0 * dt,
+            );
             if st.health.cylinder_head < 0.5 {
                 st.head_warped = true;
                 Self::fail(st, FailureCause::WarpedHead, log, now);
             }
         }
         if st.head_warped && st.gasket_breach.is_none() {
-            st.health.head_gasket -= 0.02 * dt;
+            wear(
+                &mut st.health.head_gasket,
+                &mut st.pending.head_gasket,
+                0.02 * dt,
+            );
             if st.health.head_gasket < 0.3 {
                 st.gasket_breach = Some(0);
                 Self::fail(st, FailureCause::HeadGasket { cylinder: 0 }, log, now);
@@ -317,13 +357,15 @@ impl DamageModel {
         if let Some((omega_max, t_limit)) = self.turbo_limits {
             if !st.turbo_failed {
                 let over = ctx.turbo_omega / omega_max - 1.0;
+                let mut rate = 0.0;
                 if over > 0.0 {
                     let x = over / 0.05;
-                    st.health.turbo -= 0.05 * x * x * dt;
+                    rate += 0.05 * x * x;
                 }
                 if ctx.turbine_inlet_k > t_limit {
-                    st.health.turbo -= 0.002 * (ctx.turbine_inlet_k - t_limit) / 50.0 * dt;
+                    rate += 0.002 * (ctx.turbine_inlet_k - t_limit) / 50.0;
                 }
+                wear(&mut st.health.turbo, &mut st.pending.turbo, rate * dt);
                 if st.health.turbo < 0.05 {
                     st.health.turbo = 0.0;
                     st.turbo_failed = true;
@@ -334,7 +376,11 @@ impl DamageModel {
 
         // Catalyst substrate melting.
         if !st.catalyst_failed && ctx.t_catalyst > lim.catalyst_melt_k {
-            st.health.catalyst -= 0.02 * ((ctx.t_catalyst - lim.catalyst_melt_k) / 50.0 + 1.0) * dt;
+            wear(
+                &mut st.health.catalyst,
+                &mut st.pending.catalyst,
+                0.02 * ((ctx.t_catalyst - lim.catalyst_melt_k) / 50.0 + 1.0) * dt,
+            );
             if st.health.catalyst < 0.2 {
                 st.catalyst_failed = true;
                 Self::fail(st, FailureCause::CatalystMeltdown, log, now);
@@ -459,5 +505,36 @@ mod tests {
         }
         assert_eq!(st.fatal, Some(FailureCause::SpunBearing));
         assert!(t < 60.0, "{t}");
+    }
+
+    #[test]
+    fn slow_wear_accumulates_exactly_at_the_physics_step() {
+        // Bearing at 97 % oil film, 3000 rpm, load 1 for one simulated hour at 4 kHz: the
+        // f32 health must follow the exact integral instead of rounding each step away.
+        let spec = EngineSpec::naturally_aspirated_2l();
+        let model = DamageModel::new(&spec);
+        let mut st = DamageState::default();
+        let mut log = EventLog::default();
+        let required = spec.limits.bearing_oil_per_krpm * 3.0;
+        let ctx = DamageContext {
+            rpm: 3000.0,
+            oil_pressure_pa: 0.97 * required,
+            t_metal: 360.0,
+            t_piston: [450.0; MAX_CYLINDERS],
+            turbo_omega: 0.0,
+            turbine_inlet_k: 900.0,
+            t_catalyst: 900.0,
+            load: 1.0,
+        };
+        let dt = 2.5e-4;
+        for _ in 0..(3600.0 / dt) as usize {
+            model.update(&mut st, &ctx, dt, &mut log, 0.0);
+        }
+        let exact = 1.0 - BEARING_WEAR_RATE as f64 * 0.03f64.powi(2) * 3.0 * 2.0 * 3600.0;
+        assert!(
+            (f64::from(st.health.bearings) - exact).abs() < 1.0e-3,
+            "{} vs {exact}",
+            st.health.bearings
+        );
     }
 }

@@ -377,6 +377,9 @@ pub struct TurboSpec {
     pub bearing_loss: f32,
     /// Maximum continuous turbine inlet temperature \[K\].
     pub turbine_inlet_limit_k: f32,
+    /// Highest manifold pressure the hardware (gasket clamp, rods, fuel system) is built
+    /// to withstand continuously [Pa abs]; drives the Overboost instructor warning.
+    pub max_manifold_pressure_pa: f32,
 }
 
 /// Complete physical description of an engine.
@@ -418,8 +421,8 @@ impl EngineSpec {
     /// Generic 2.0 L naturally aspirated DOHC 16V inline-four (the free introductory engine).
     ///
     /// Square 86 × 86 mm bore/stroke (1998 cm³), 10.5:1 compression, tuned intake runners
-    /// peaking near 4800 rpm. Comparable to mainstream 2.0 L engines of the 2000s:
-    /// ≈ 185 N·m and ≈ 105 kW.
+    /// peaking near 4800 rpm. Comparable to mainstream 2.0 L engines of the 2000s: on the
+    /// generated base calibration ≈ 190 N·m at 4500 rpm and ≈ 107 kW at 6500 rpm.
     pub fn naturally_aspirated_2l() -> Self {
         Self {
             geometry: GeometrySpec {
@@ -533,7 +536,8 @@ impl EngineSpec {
 
     /// Generic 2.0 L turbocharged inline-four (premium forced-induction module).
     ///
-    /// 9.5:1 compression, forged internals, ≈ 1 bar boost: ≈ 330 N·m and ≈ 180 kW.
+    /// 9.5:1 compression, forged internals, 0.8 bar factory boost: on the generated base
+    /// calibration ≈ 295 N·m at 4000 rpm and ≈ 155 kW at 5500 rpm.
     pub fn turbocharged_2l() -> Self {
         let mut spec = Self::naturally_aspirated_2l();
         spec.geometry.compression_ratio = 9.5;
@@ -597,6 +601,9 @@ impl EngineSpec {
             bearing_loss: 1.24e-6,
             // 1050 °C: limit of Inconel 713C turbine wheels.
             turbine_inlet_limit_k: 1323.0,
+            // 1.4 bar boost: the forged bottom end and MLS gasket are rated with margin
+            // above the 0.8 bar factory target.
+            max_manifold_pressure_pa: 240_000.0,
         });
         spec
     }
@@ -696,6 +703,108 @@ impl EngineSpec {
                 return Err(SpecError::NonPositive(name));
             }
         }
+        let b = &self.breathing;
+        let fr = &self.friction;
+        let th = &self.thermal;
+        let lub = &self.lubrication;
+        let lim = &self.limits;
+        let non_negative: [(&'static str, f32); 20] = [
+            ("ram_gain", b.ram_gain),
+            ("overlap_loss", b.overlap_loss),
+            ("charge_heating", b.charge_heating),
+            ("idle_valve_area_m2", self.throttle.idle_valve_area_m2),
+            ("leak_area_m2", self.throttle.leak_area_m2),
+            ("filter_restriction", self.intake.filter_restriction),
+            ("latent_heat", self.fuel.latent_heat),
+            (
+                "injector_dead_time_s",
+                self.fuel_system.injector_dead_time_s,
+            ),
+            ("fmep_constant_pa", fr.fmep_constant_pa),
+            ("fmep_peak_pressure_coeff", fr.fmep_peak_pressure_coeff),
+            ("fmep_speed", fr.fmep_speed),
+            ("fmep_speed_sq", fr.fmep_speed_sq),
+            ("accessory_power_w", fr.accessory_power_w),
+            ("metal_oil_ua", th.metal_oil_ua),
+            ("metal_ambient_ua", th.metal_ambient_ua),
+            ("oil_ambient_ua", th.oil_ambient_ua),
+            ("exhaust.backpressure", self.exhaust.backpressure),
+            ("valve_contact_margin_rpm", lim.valve_contact_margin_rpm),
+            ("bearing_oil_per_krpm", lim.bearing_oil_per_krpm),
+            ("vogel_b", lub.vogel_b),
+        ];
+        for (name, v) in non_negative {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(SpecError::OutOfRange(name));
+            }
+        }
+        // (name, value, min, max), inclusive.
+        let ranged: [(&'static str, f32, f32, f32); 19] = [
+            (
+                "injector_dead_time_slope_s_per_v",
+                self.fuel_system.injector_dead_time_slope_s_per_v,
+                -1.0e-3,
+                1.0e-3,
+            ),
+            (
+                "in_cylinder_evaporation",
+                self.fuel.in_cylinder_evaporation,
+                0.0,
+                1.0,
+            ),
+            ("base_ve", b.base_ve, 0.1, 1.5),
+            ("wiebe_m", self.combustion.wiebe_m, -0.9, 10.0),
+            (
+                "compression_index",
+                self.combustion.compression_index,
+                1.1,
+                1.45,
+            ),
+            ("alternator_efficiency", fr.alternator_efficiency, 0.1, 1.0),
+            ("thermostat_start_k", th.thermostat_start_k, 273.15, 420.0),
+            ("thermostat_full_k", th.thermostat_full_k, 273.15, 430.0),
+            ("coolant_boil_k", th.coolant_boil_k, 350.0, 500.0),
+            (
+                "catalyst_light_off_k",
+                th.catalyst_light_off_k,
+                300.0,
+                1000.0,
+            ),
+            ("vogel_c", lub.vogel_c, 0.0, 250.0),
+            ("viscosity_exponent", lub.viscosity_exponent, 0.0, 3.0),
+            ("reference_temp_k", lub.reference_temp_k, 273.15, 450.0),
+            ("rod_fatigue_exponent", lim.rod_fatigue_exponent, 1.0, 30.0),
+            (
+                "piston_crown_limit_k",
+                lim.piston_crown_limit_k,
+                350.0,
+                1000.0,
+            ),
+            ("head_warp_k", lim.head_warp_k, 350.0, 800.0),
+            ("catalyst_melt_k", lim.catalyst_melt_k, 600.0, 2500.0),
+            ("valve_float_rpm", lim.valve_float_rpm, 1000.0, 30_000.0),
+            ("redline_rpm", lim.redline_rpm, 1000.0, 30_000.0),
+        ];
+        for (name, v, lo, hi) in ranged {
+            if !(v.is_finite() && v >= lo && v <= hi) {
+                return Err(SpecError::OutOfRange(name));
+            }
+        }
+        if self.valves.intake_valves_per_cylinder == 0 {
+            return Err(SpecError::OutOfRange("intake_valves_per_cylinder"));
+        }
+        if th.coolant_boil_k <= th.thermostat_full_k {
+            return Err(SpecError::OutOfRange("coolant_boil_k"));
+        }
+        if lim.piston_crown_melt_k <= lim.piston_crown_limit_k {
+            return Err(SpecError::OutOfRange("piston_crown_melt_k"));
+        }
+        if lim.rod_ultimate_force_n <= lim.rod_endurance_force_n {
+            return Err(SpecError::OutOfRange("rod_ultimate_force_n"));
+        }
+        if lim.catalyst_melt_k <= th.catalyst_light_off_k + 100.0 {
+            return Err(SpecError::OutOfRange("catalyst_melt_k"));
+        }
         if !(g.compression_ratio > 4.0 && g.compression_ratio < 25.0) {
             return Err(SpecError::OutOfRange("compression_ratio"));
         }
@@ -718,6 +827,13 @@ impl EngineSpec {
         if !(0.0..=1.0).contains(&self.thermal.piston_heat_share) {
             return Err(SpecError::OutOfRange("piston_heat_share"));
         }
+        // A healthy engine must be able to meet its own bearing oil requirement up to
+        // 500 rpm beyond redline (where the factory limiter sits).
+        let oil_needed =
+            self.limits.bearing_oil_per_krpm * (self.limits.redline_rpm + 500.0) / 1000.0;
+        if self.lubrication.relief_pressure_pa < oil_needed {
+            return Err(SpecError::OutOfRange("relief_pressure_pa"));
+        }
         if !(0.0..=1.0).contains(&self.fuel.in_cylinder_evaporation) {
             return Err(SpecError::OutOfRange("in_cylinder_evaporation"));
         }
@@ -725,7 +841,7 @@ impl EngineSpec {
             return Err(SpecError::OutOfRange("compression_index"));
         }
         if let Some(t) = &self.turbo {
-            let turbo_positive: [(&'static str, f32); 13] = [
+            let turbo_positive: [(&'static str, f32); 14] = [
                 ("compressor_diameter_m", t.compressor_diameter_m),
                 ("turbine_diameter_m", t.turbine_diameter_m),
                 ("rotor_inertia_kg_m2", t.rotor_inertia_kg_m2),
@@ -739,11 +855,29 @@ impl EngineSpec {
                 ("boost_volume_m3", t.boost_volume_m3),
                 ("bov_crack_pa", t.bov_crack_pa),
                 ("turbine_inlet_limit_k", t.turbine_inlet_limit_k),
+                ("max_manifold_pressure_pa", t.max_manifold_pressure_pa),
             ];
             for (name, v) in turbo_positive {
                 if !(v.is_finite() && v > 0.0) {
                     return Err(SpecError::NonPositive(name));
                 }
+            }
+            let turbo_non_negative: [(&'static str, f32); 4] = [
+                ("wastegate_area_m2", t.wastegate_area_m2),
+                ("wastegate_spring_pa", t.wastegate_spring_pa),
+                ("bov_area_m2", t.bov_area_m2),
+                ("bearing_loss", t.bearing_loss),
+            ];
+            for (name, v) in turbo_non_negative {
+                if !(v.is_finite() && v >= 0.0) {
+                    return Err(SpecError::OutOfRange(name));
+                }
+            }
+            if t.compressor_peak_efficiency > 1.0 {
+                return Err(SpecError::OutOfRange("compressor_peak_efficiency"));
+            }
+            if t.turbine_peak_efficiency > 1.0 {
+                return Err(SpecError::OutOfRange("turbine_peak_efficiency"));
             }
             if !(0.0..=1.0).contains(&t.intercooler_effectiveness) {
                 return Err(SpecError::OutOfRange("intercooler_effectiveness"));
@@ -838,7 +972,8 @@ impl LubricationSpec {
             // Bearing leakage obeys Hagen–Poiseuille (Δp ∝ μ); the relief and the
             // pressure-compensated pump soften that to ≈ μ^0.8.
             viscosity_exponent: 0.8,
-            relief_pressure_pa: 450_000.0,
+            // 5.5 bar: covers the "10 psi per 1000 rpm" bearing requirement up to 8000 rpm.
+            relief_pressure_pa: 550_000.0,
             reference_temp_k: 363.15,
         }
     }
@@ -928,5 +1063,31 @@ mod tests {
         let mut s = EngineSpec::naturally_aspirated_2l();
         s.geometry.firing_order = [0, 0, 3, 1, 0, 0, 0, 0];
         assert_eq!(s.validate(), Err(SpecError::FiringOrder));
+    }
+
+    #[test]
+    fn non_finite_parameters_are_rejected_everywhere() {
+        let edits: [fn(&mut EngineSpec); 10] = [
+            |s| s.friction.fmep_speed = f32::NAN,
+            |s| s.friction.accessory_power_w = f32::NAN,
+            |s| s.exhaust.backpressure = f32::NAN,
+            |s| s.breathing.ram_gain = f32::INFINITY,
+            |s| s.combustion.wiebe_m = f32::NAN,
+            |s| s.throttle.idle_valve_area_m2 = f32::NAN,
+            |s| s.thermal.thermostat_start_k = f32::NAN,
+            |s| s.limits.rod_fatigue_exponent = f32::NAN,
+            |s| s.lubrication.vogel_c = f32::NAN,
+            |s| s.lubrication.relief_pressure_pa = 300_000.0,
+        ];
+        for edit in edits {
+            let mut s = EngineSpec::naturally_aspirated_2l();
+            edit(&mut s);
+            assert!(s.validate().is_err());
+        }
+        let mut t = EngineSpec::turbocharged_2l();
+        if let Some(turbo) = t.turbo.as_mut() {
+            turbo.bearing_loss = f32::NAN;
+        }
+        assert!(t.validate().is_err());
     }
 }

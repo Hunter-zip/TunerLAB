@@ -36,8 +36,11 @@ pub(crate) const GRAVITY: f32 = 9.806_65;
 
 /// Pressure ratio above which the isentropic flow function is replaced by its secant to
 /// zero. The exact Ψ(Pr) has an infinite slope at Pr → 1, which makes the manifold ODE
-/// infinitely stiff at wide-open throttle; real throttles transition to laminar (linear
-/// Δp) flow in exactly this region, so the linearisation is physical, not just numerical.
+/// infinitely stiff at wide-open throttle. This is a *numerical* regularisation: throttle
+/// Reynolds numbers stay above 10⁵ even at Δp ≈ 1 kPa, so real flow remains turbulent
+/// (ṁ ∝ √Δp). Inside the band the secant under-predicts flow (−11 % at Pr = 0.988,
+/// −43 % at 0.995), i.e. a given flow needs a slightly larger Δp — at most a few hundred
+/// pascals of extra wide-open-throttle loss.
 const LINEAR_FLOW_PR: f32 = 0.985;
 
 /// Isentropic orifice flow function Ψ(Pr) (Heywood, *ICE Fundamentals*, App. C):

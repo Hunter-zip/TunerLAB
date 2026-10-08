@@ -4,7 +4,7 @@
 //! delay, MAP filtering), noise and fault hooks. Diagnosis in Engine Autopsy is performed
 //! exclusively on these readings.
 
-use super::controls::Controls;
+use super::controls::{Controls, LoadModel};
 use super::faults::FaultState;
 use super::math::{approach, clampf, Pcg32};
 use super::plant::Plant;
@@ -29,8 +29,9 @@ const OIL_TEMP_TAU_S: f32 = 5.0;
 const EGT_TAU_S: f32 = 0.7;
 /// MAP sensor + ECU anti-alias filter time constant \[s\].
 const MAP_TAU_S: f32 = 0.003;
-/// Open-circuit IAT reading: the ECU's pull-up drives the input to the cold rail.
-const IAT_OPEN_READING_C: f32 = -40.0;
+/// Open-circuit IAT reading: the ECU's pull-up drives the input to the cold rail, below
+/// the sensor's −40 °C operating range so it cannot be confused with arctic air.
+const IAT_OPEN_READING_C: f32 = -50.0;
 
 /// Everything the ECU can measure, in engineering units.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -63,6 +64,10 @@ pub struct SensorReadings {
     pub battery_v: f32,
     /// Vehicle speed \[km/h\].
     pub vehicle_speed_kph: f32,
+    /// Clutch pedal position switch: pedal not fully released (vehicle mode only).
+    pub clutch_pedal_pressed: bool,
+    /// Park/neutral position switch: gearbox in neutral (always set off the vehicle).
+    pub neutral: bool,
     /// Knock sensor signal, windowed per cylinder \[V-equivalent\].
     pub knock_signal: [f32; MAX_CYLINDERS],
     /// Crank segment sequence counter (increments once per firing TDC).
@@ -97,6 +102,8 @@ impl SensorReadings {
             egt_c: amb_c,
             battery_v: 12.6,
             vehicle_speed_kph: 0.0,
+            clutch_pedal_pressed: false,
+            neutral: true,
             knock_signal: [0.0; MAX_CYLINDERS],
             segment_seq: 0,
             segment_cylinder: 0,
@@ -194,6 +201,11 @@ impl SensorState {
         r.egt_c = approach(r.egt_c, plant.air.t_exh - ZERO_CELSIUS_K, dt, EGT_TAU_S);
         r.battery_v = plant.battery_v + 0.02 * rng.normal();
         r.vehicle_speed_kph = plant.crank.vehicle_speed * 3.6;
+        (r.clutch_pedal_pressed, r.neutral) = match &ctl.load {
+            // The top-of-travel switch opens within the last few percent of pedal travel.
+            LoadModel::Vehicle(v) => (v.clutch < 0.95, v.gear == 0),
+            LoadModel::Neutral | LoadModel::Dyno(_) => (false, true),
+        };
         r.turbo_rpm = plant.air.turbo_omega * super::math::RAD_S_TO_RPM;
 
         // Wide-band λ: gas travels from the exhaust valve to the sensor (transport delay

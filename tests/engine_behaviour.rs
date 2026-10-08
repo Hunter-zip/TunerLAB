@@ -2,12 +2,14 @@
 //! closed-loop control, knock, faults, damage, determinism and input hygiene.
 
 use tunerlab_core::engine_sim::calibration::CalibrationError;
-use tunerlab_core::engine_sim::controls::{DynoParams, LoadModel};
+use tunerlab_core::engine_sim::controls::{DynoParams, LoadModel, VehicleParams};
 use tunerlab_core::engine_sim::dtc::DtcCode;
+use tunerlab_core::engine_sim::events::EventKind;
+use tunerlab_core::engine_sim::faults::FaultError;
 use tunerlab_core::engine_sim::SimError;
 use tunerlab_core::{
     Calibration, EngineCondition, EngineSim, EngineSpec, FailureCause, Fault, FaultId, Language,
-    Localize, Warning,
+    Localize, MessageKey, Warning,
 };
 
 const FRAME: f32 = 1.0 / 60.0;
@@ -393,7 +395,7 @@ fn dead_knock_sensor_is_detected_and_disables_protection() {
 fn weak_fuel_pump_starves_the_engine_at_full_load() {
     let mut sim = warm_na(17);
     sim.inject_fault(Fault::FuelPumpWeak {
-        capacity_fraction: 0.2,
+        capacity_fraction: 0.12,
     })
     .unwrap();
     dyno(&mut sim, 2000.0, 0.15);
@@ -441,4 +443,299 @@ fn thermostat_stuck_closed_overheats_under_load() {
     assert!(t.coolant_temp_c > 112.0, "coolant {}", t.coolant_temp_c);
     assert!(t.warnings.contains(Warning::Overheat));
     assert!(sim.dtcs().contains(DtcCode::P0217));
+}
+
+fn warm_turbo(seed: u64) -> EngineSim {
+    let mut sim = EngineSim::with_base_calibration(EngineSpec::turbocharged_2l(), seed).unwrap();
+    sim.prewarm();
+    start(&mut sim);
+    sim
+}
+
+fn vehicle(sim: &mut EngineSim, gear: u8, clutch: f32, pedal: f32) {
+    sim.update_controls(|c| {
+        c.pedal = pedal;
+        c.load = LoadModel::Vehicle(VehicleParams {
+            gear,
+            clutch,
+            ..VehicleParams::default()
+        });
+    });
+}
+
+/// Pulls away in first gear, letting the clutch in over two seconds.
+fn drive_away(sim: &mut EngineSim) {
+    for i in 0..=120 {
+        vehicle(sim, 1, i as f32 / 120.0, 0.35);
+        sim.tick(FRAME);
+    }
+    run(sim, 2.0);
+}
+
+#[test]
+fn cold_idle_keeps_warming_up() {
+    // Regression: the thermal network once stalled the coolant near 54 °C at idle because
+    // per-step heat increments fell below f32 resolution.
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 20).unwrap();
+    start(&mut sim);
+    run(&mut sim, 540.0);
+    let ect_9min = sim.telemetry().coolant_temp_c;
+    run(&mut sim, 60.0);
+    let ect_10min = sim.telemetry().coolant_temp_c;
+    assert!(ect_10min > 62.0, "coolant after 10 min idle {ect_10min}");
+    assert!(ect_10min > ect_9min + 0.5, "warm-up stalled at {ect_10min}");
+    // A healthy engine idling from cold has not consumed enough air for the thermostat
+    // monitor to judge it, so P0128 must not set.
+    assert!(!sim.dtcs().contains(DtcCode::P0128));
+}
+
+#[test]
+fn thermostat_stuck_open_sets_p0128_under_load() {
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 21).unwrap();
+    sim.inject_fault(Fault::ThermostatStuckOpen).unwrap();
+    start(&mut sim);
+    dyno(&mut sim, 2500.0, 0.3);
+    run(&mut sim, 240.0);
+    assert!(sim.telemetry().coolant_temp_c < 60.0);
+    assert!(sim.dtcs().contains(DtcCode::P0128));
+}
+
+#[test]
+fn misfire_is_detected_and_attributed_while_driving_in_gear() {
+    let mut sim = warm_na(22);
+    sim.inject_fault(Fault::IgnitionCoilWeak {
+        cylinder: 2,
+        strength: 0.4,
+    })
+    .unwrap();
+    drive_away(&mut sim);
+    vehicle(&mut sim, 2, 1.0, 0.6);
+    run(&mut sim, 4.0);
+    vehicle(&mut sim, 3, 1.0, 1.0);
+    run(&mut sim, 8.0);
+    let codes: Vec<_> = sim.dtcs().iter().collect();
+    assert!(sim.dtcs().contains(DtcCode::P0303), "{codes:?}");
+    // The clutch damper must not smear the signature onto other cylinders.
+    assert_eq!(codes, vec![DtcCode::P0303]);
+    assert!(sim.telemetry().vehicle_speed_kph > 60.0);
+}
+
+#[test]
+fn declutching_after_a_coast_in_gear_does_not_stall() {
+    let mut sim = warm_na(23);
+    drive_away(&mut sim);
+    vehicle(&mut sim, 2, 1.0, 0.4);
+    run(&mut sim, 4.0);
+    // Coast in gear with the pedal released (fuel cut), then press the clutch.
+    vehicle(&mut sim, 2, 1.0, 0.0);
+    run(&mut sim, 8.0);
+    vehicle(&mut sim, 2, 0.0, 0.0);
+    let mut min_rpm = f32::MAX;
+    for _ in 0..(6.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        min_rpm = min_rpm.min(sim.telemetry().rpm);
+    }
+    assert_eq!(sim.condition(), EngineCondition::Running);
+    assert!(min_rpm > 600.0, "dipped to {min_rpm}");
+    let rpm = average(&mut sim, 3.0, |t| t.rpm);
+    assert!((700.0..950.0).contains(&rpm), "idle after declutch {rpm}");
+}
+
+#[test]
+fn stuck_wastegate_trips_the_latched_overboost_cut() {
+    let mut sim = warm_turbo(24);
+    sim.inject_fault(Fault::WastegateStuckClosed).unwrap();
+    dyno(&mut sim, 4500.0, 1.0);
+    run(&mut sim, 4.0);
+    assert!(sim.dtcs().contains(DtcCode::P0234));
+    // Fuel stays cut while the pedal is held, so boost collapses instead of cycling.
+    let t = sim.telemetry();
+    assert!(
+        t.manifold_pressure_kpa < 200.0,
+        "MAP {}",
+        t.manifold_pressure_kpa
+    );
+    assert_eq!(t.injector_pulse_ms, 0.0);
+    // Lifting off re-arms the fuel.
+    sim.update_controls(|c| c.pedal = 0.1);
+    run(&mut sim, 1.0);
+    assert!(sim.telemetry().injector_pulse_ms > 0.0);
+}
+
+#[test]
+fn overboost_warning_follows_hardware_not_the_editable_ecu_limit() {
+    let mut sim = warm_turbo(25);
+    sim.update_calibration(|c| c.boost.overboost_limit_kpa = 400.0)
+        .unwrap();
+    sim.inject_fault(Fault::WastegateStuckClosed).unwrap();
+    dyno(&mut sim, 4500.0, 1.0);
+    let mut warned = false;
+    for _ in 0..(10.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        warned |= sim.telemetry().warnings.contains(Warning::Overboost);
+    }
+    assert!(warned);
+}
+
+#[test]
+fn healthy_engine_has_enough_oil_pressure_up_to_redline() {
+    let mut sim = warm_na(26);
+    dyno(&mut sim, 6700.0, 1.0);
+    run(&mut sim, 10.0);
+    let t = sim.telemetry();
+    assert!(!t.warnings.contains(Warning::LowOilPressure));
+    assert!(t.health.bearings > 0.999, "bearings {}", t.health.bearings);
+}
+
+#[test]
+fn clear_dtcs_resets_codes_monitors_and_telemetry_at_once() {
+    let mut sim = warm_na(27);
+    sim.inject_fault(Fault::IntakeAirSensorOpen).unwrap();
+    run(&mut sim, 4.0);
+    assert!(sim.dtcs().contains(DtcCode::P0113));
+    sim.clear_faults();
+    sim.clear_dtcs();
+    // The snapshot reflects the scan-tool action without waiting for a tick.
+    assert!(sim.dtcs().is_empty());
+    assert_eq!(sim.telemetry().dtc_count, 0);
+    assert!(!sim.telemetry().warnings.contains(Warning::CheckEngine));
+    assert_eq!(sim.telemetry().ltft_pct, 0.0);
+}
+
+#[test]
+fn reset_keeps_event_cursors_valid() {
+    let mut sim = warm_na(28);
+    run(&mut sim, 2.0);
+    let log_cursor = sim.events().next_seq();
+    let cyl_cursor = sim.cylinder_events().next_seq();
+    sim.reset();
+    assert_eq!(sim.events().since(0).count(), 0);
+    start(&mut sim);
+    run(&mut sim, 1.0);
+    assert!(sim.events().since(log_cursor).count() > 0);
+    assert!(sim.cylinder_events().since(cyl_cursor).count() > 50);
+    assert!(sim.events().next_seq() > log_cursor);
+}
+
+#[test]
+fn repairing_a_running_engine_keeps_it_running() {
+    let mut sim = warm_na(29);
+    dyno(&mut sim, 4000.0, 0.5);
+    run(&mut sim, 3.0);
+    let rpm = sim.telemetry().rpm;
+    let events = sim.events().next_seq();
+    sim.repair();
+    assert_eq!(sim.condition(), EngineCondition::Running);
+    assert_eq!(
+        sim.events().next_seq(),
+        events,
+        "no spurious condition change"
+    );
+    run(&mut sim, 0.2);
+    assert!((sim.telemetry().rpm - rpm).abs() < 200.0);
+}
+
+#[test]
+fn stopped_engine_reports_no_live_ecu_values() {
+    let mut sim = warm_na(30);
+    run(&mut sim, 30.0);
+    assert!(sim.telemetry().closed_loop);
+    // Stall it with the key on.
+    dyno(&mut sim, 300.0, 0.0);
+    run(&mut sim, 4.0);
+    let t = sim.telemetry();
+    assert_eq!(t.condition, EngineCondition::Stalled);
+    assert!(!t.closed_loop);
+    assert_eq!(t.stft_pct, 0.0);
+    assert_eq!(t.ignition_advance_deg, 0.0);
+}
+
+#[test]
+fn faults_must_be_applicable_and_detectable() {
+    let mut sim = warm_na(31);
+    assert_eq!(
+        sim.inject_fault(Fault::BoostLeak { diameter_mm: 20.0 }),
+        Err(SimError::Fault(FaultError::NotApplicable))
+    );
+    assert_eq!(
+        sim.inject_fault(Fault::VacuumLeak { diameter_mm: 0.0 }),
+        Err(SimError::Fault(FaultError::InvalidParameter))
+    );
+    assert!(!sim.is_fault_active(FaultId::BoostLeak));
+}
+
+#[test]
+fn engine_autopsy_faults_leave_their_signatures() {
+    // IAT open circuit → P0113.
+    let mut sim = warm_na(32);
+    sim.inject_fault(Fault::IntakeAirSensorOpen).unwrap();
+    run(&mut sim, 5.0);
+    assert!(sim.dtcs().contains(DtcCode::P0113));
+    // O2 sensor reading lean → the trims add fuel until the lean code sets.
+    let mut sim = warm_na(33);
+    sim.inject_fault(Fault::OxygenSensorBias { lambda: 0.3 })
+        .unwrap();
+    dyno(&mut sim, 2500.0, 0.2);
+    run(&mut sim, 120.0);
+    assert!(sim.dtcs().contains(DtcCode::P0171));
+    assert!(sim.telemetry().ltft_pct > 10.0);
+    // Leaking cylinder 2 → its misfire code only.
+    let mut sim = warm_na(34);
+    sim.inject_fault(Fault::LowCompression {
+        cylinder: 1,
+        leak_fraction: 0.6,
+    })
+    .unwrap();
+    dyno(&mut sim, 2500.0, 0.5);
+    run(&mut sim, 15.0);
+    assert_eq!(sim.dtcs().iter().collect::<Vec<_>>(), vec![DtcCode::P0302]);
+    // Restricted exhaust → back-pressure up, torque down.
+    let mut healthy = warm_na(35);
+    let mut blocked = warm_na(35);
+    blocked
+        .inject_fault(Fault::ExhaustRestriction { factor: 8.0 })
+        .unwrap();
+    for sim in [&mut healthy, &mut blocked] {
+        dyno(sim, 4000.0, 1.0);
+        run(sim, 5.0);
+    }
+    let (h, b) = (healthy.telemetry(), blocked.telemetry());
+    assert!(b.exhaust_pressure_kpa > h.exhaust_pressure_kpa + 30.0);
+    assert!(b.brake_torque_nm < 0.92 * h.brake_torque_nm);
+}
+
+#[test]
+fn warnings_and_events_do_not_depend_on_frame_rate() {
+    let record = |frame: f32| {
+        let mut sim = warm_na(36);
+        sim.update_controls(|c| c.pedal = 1.0);
+        let frames = (3.0 / frame).round() as usize;
+        for _ in 0..frames {
+            sim.tick(frame);
+        }
+        sim.events()
+            .iter()
+            .map(|e| (e.seq, e.time_s, e.kind))
+            .collect::<Vec<_>>()
+    };
+    let slow = record(1.0 / 30.0);
+    let fast = record(1.0 / 240.0);
+    assert!(slow.iter().any(|e| matches!(e.2, EventKind::Warning(_))));
+    assert_eq!(slow, fast);
+}
+
+#[test]
+fn status_key_renders_through_any_localizer() {
+    use tunerlab_core::engine_sim::i18n::{Localizer, StaticLocalizer};
+    let sim = EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 37).unwrap();
+    assert_eq!(
+        sim.status_key(),
+        MessageKey::Condition(EngineCondition::Off)
+    );
+    let pl = StaticLocalizer {
+        language: Language::Pl,
+    };
+    assert_eq!(pl.text(sim.status_key()), sim.status_text(Language::Pl));
 }

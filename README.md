@@ -20,7 +20,7 @@ Ultimately, TunerLAB aims to recreate the structural behavior, datalogs, and use
 ## 🛠️ Tech Stack & Key Features
 
 - **Core Engine:** Written in pure, modern **Rust** with an allocation-free, lock-free simulation loop (verified by a counting-allocator test), ready to be driven from a real-time audio thread.
-- **Physics Simulation:** Crank-angle-resolved combustion, compressible air path, turbocharging, knock, thermal and damage models running at 4 kHz, ≈ 100× faster than real time.
+- **Physics Simulation:** Crank-angle-resolved combustion, compressible air path, turbocharging, knock, thermal and damage models running at 4 kHz, 130–180× faster than real time.
 - **Cross-Platform & Lightweight:** Windows 10/11 and Linux, OpenGL/Vulkan rendering via `egui` (Phase 3).
 - **Localization (i18n):** **English (EN)** and **Polish (PL)** for every status, warning, trouble code, failure and fault from day one.
 - **Business Model (Freemium):** Entry-level concepts and naturally aspirated tuning are free. Advanced modules (forced induction, launch control, full calibration workflows) are unlocked via a premium course tier.
@@ -54,10 +54,10 @@ Faults (Engine Autopsy) inject into plant and sensors; the ECU is never told.
 | **Turbo** | Compressor speed lines with surge, efficiency island, intercooler, turbine with blade-speed-ratio efficiency, pneumatic wastegate + bleed solenoid, blow-off valve, rotor dynamics |
 | **Breathing** | Wave ram tuning, overlap reversion, Taylor inlet Mach index choking, residual-gas expansion, charge heating, cam phasing, valve float |
 | **Combustion** | Slider-crank kinematics, Wiebe heat release, Brunt γ(T), Woschni heat transfer, Metghalchi–Keck flame speed, Paschen spark breakdown, Livengood–Wu + Douaud–Eyzat knock integral, cycle-to-cycle variation, exhaust energy balance. MBT, knock limits and lean/rich misfire limits are **emergent**, not tables |
-| **Dynamics** | Per-cylinder gas-torque pulses, Chen–Flynn friction with oil viscosity, starter, two-mass dynamometer, vehicle with clutch and gearbox |
-| **Thermal** | Metal, coolant (thermostat, radiator ε–NTU, boil-over), oil (Vogel viscosity, pressure, fuel dilution), piston crowns, exhaust manifold, catalyst with exotherm |
-| **Sensors** | MAP, IAT, ECT, oil, fuel rail, wide-band λ with transport delay, EGT, knock, crank TDC speed, cam phase, rear O2 |
-| **ECU** | Speed-density, inverse X–τ transient fuel, warm-up/after-start/cranking fuel, closed-loop STFT/LTFT, idle PI + idle spark, per-cylinder knock control, rev limiter, DFCO, boost PID, OBD-II misfire monitor and 25 SAE J2012 trouble codes |
+| **Dynamics** | Per-cylinder gas-torque pulses, Chen–Flynn friction with oil viscosity, starter, two-mass dynamometer, vehicle with clutch damper springs and gearbox |
+| **Thermal** | Metal, coolant (thermostat, cross-flow radiator ε–NTU, boil-over), oil (Vogel viscosity, pressure, fuel dilution, piston cooling), piston crowns, exhaust manifold, catalyst with exotherm; energy-conserving network |
+| **Sensors** | MAP, IAT, ECT, oil, fuel rail, wide-band λ with transport delay, EGT, knock, crank TDC speed, cam phase, rear O2, clutch and neutral switches |
+| **ECU** | Speed-density, inverse X–τ transient fuel, warm-up/after-start/cranking fuel, closed-loop STFT/LTFT, idle PI + idle spark + dashpot, per-cylinder knock control, rev limiter, DFCO with decel look-ahead, boost PID with latched overboost cut, OBD-II monitors (misfire, thermostat by airflow model, catalyst by temperature model, O2 response, MAP/IAT circuits) and 25 SAE J2012 trouble codes |
 | **Damage** | Knock erosion, piston crown melting, Basquin/Miner rod fatigue, rod buckling, valve-to-piston contact, head gasket, head warp, bearing wear, turbo overspeed, catalyst meltdown |
 | **Faults** | 17 hidden Engine Autopsy faults (sensor bias, slow O2, vacuum leak, clogged injector, weak coil, thermostat, timing chain, fuel pump, exhaust restriction, low compression, boost leak, wastegate) |
 
@@ -65,8 +65,8 @@ Reference results on the generated factory base maps (95 RON, 25 °C):
 
 | Engine | Peak torque | Peak power | Hot idle |
 |---|---|---|---|
-| 2.0 L NA I4, 10.5:1 | ≈ 200 N·m @ 3500 rpm | ≈ 107 kW @ 6000 rpm | 800 rpm, 25 kPa MAP, λ 1.00 closed loop |
-| 2.0 L turbo I4, 9.5:1, 0.8 bar | ≈ 316 N·m @ 4000 rpm | ≈ 170 kW @ 6500 rpm | — |
+| 2.0 L NA I4, 10.5:1 | ≈ 190 N·m @ 4500 rpm | ≈ 107 kW @ 6500 rpm | 800 rpm, 25 kPa MAP, λ 1.00 closed loop |
+| 2.0 L turbo I4, 9.5:1, 0.8 bar | ≈ 297 N·m @ 4000 rpm | ≈ 154 kW @ 5500 rpm | — |
 
 ### Quick start (library)
 

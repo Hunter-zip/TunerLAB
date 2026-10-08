@@ -1,14 +1,22 @@
 //! Lumped-capacitance thermal network.
 //!
-//! Nodes: engine metal, coolant, oil, one piston crown per cylinder and the catalyst.
-//! Each node obeys `C·dT/dt = ΣQ̇`. The smallest time constant (piston crown ≈ 15 s) is
-//! four orders of magnitude above the 0.25 ms step, so forward Euler is exact enough and
-//! unconditionally stable here.
+//! Nodes: engine metal, coolant, oil, one piston crown per cylinder, the catalyst and the
+//! exhaust manifold wall. Each node obeys `C·dT/dt = ΣQ̇`.
+//!
+//! The network is advanced at [`THERMAL_STEP_S`] rather than at the 0.25 ms physics step,
+//! with every heat input integrated as energy over the interval by the caller. Two reasons:
+//!
+//! * **Precision.** At 0.25 ms a 3 kW coolant input raises 12 kJ/K of coolant by
+//!   6·10⁻⁵ K per step, the same order as the f32 spacing at 360 K (3·10⁻⁵ K). Rounding
+//!   would stall the warm-up tens of kelvin short of the thermostat. At 20 ms the
+//!   increment is 80× larger and the rounding error falls below 0.5 %.
+//! * **Stability margin.** The fastest node (coolant against the metal at high pump
+//!   speed, τ ≈ 3 s) is still 150 steps long, so forward Euler stays accurate to < 1 %.
 
 use super::faults::ThermostatFault;
 use super::math::{approach, clampf, smoothstep};
 use super::spec::{ThermalSpec, MAX_CYLINDERS};
-use super::thermo::{CP_AIR, CP_COOLANT};
+use super::thermo::{CP_AIR, CP_COOLANT, CP_EXHAUST};
 
 /// Wax-element thermostat response time constant \[s\].
 const THERMOSTAT_TAU_S: f32 = 8.0;
@@ -35,6 +43,31 @@ const MANIFOLD_EMISSIVE_AREA: f32 = 0.08;
 const MANIFOLD_CONVECTION_UA: f32 = 8.0;
 /// Stefan–Boltzmann constant [W/(m²·K⁴)].
 const STEFAN_BOLTZMANN: f32 = 5.670_374e-8;
+/// Catalyst monolith gas-side conductance at 0.02 kg/s exhaust flow \[W/K\]; laminar
+/// channel flow with entrance effects scales roughly with ṁ^0.8.
+const CATALYST_UA_REF: f32 = 100.0;
+/// Still-air shell loss of the insulated, heat-shielded close-coupled converter
+/// (≈ 0.1 m² at ≈ 15 W/(m²·K) through the mat and shield) \[W/K\].
+const CATALYST_SHELL_UA: f32 = 1.5;
+/// Integration interval of the thermal network \[s\] (see module docs).
+pub(crate) const THERMAL_STEP_S: f32 = 0.02;
+
+/// Effectiveness of a single-pass cross-flow heat exchanger with both fluids unmixed
+/// (finned-tube radiator), Incropera's approximation
+/// `ε = 1 − exp[(NTU^0.22 / C_r)·(exp(−C_r·NTU^0.78) − 1)]`, which tends to
+/// `1 − exp(−NTU)` as `C_r → 0`.
+fn crossflow_unmixed_effectiveness(ntu: f32, c_r: f32) -> f32 {
+    let ntu = ntu.max(0.0);
+    if c_r < 1.0e-4 {
+        return 1.0 - (-ntu).exp();
+    }
+    let c_r = c_r.min(1.0);
+    clampf(
+        1.0 - ((ntu.powf(0.22) / c_r) * ((-c_r * ntu.powf(0.78)).exp() - 1.0)).exp(),
+        0.0,
+        1.0,
+    )
+}
 
 /// Thermal state.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,13 +101,15 @@ impl ThermalState {
     }
 }
 
-/// Boundary conditions of one thermal step.
+/// Boundary conditions of one thermal step. Heat inputs are energies integrated over the
+/// step; flows and speeds are averages over it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ThermalInputs {
-    /// Combustion heat deposited into the metal during this step \[J\].
+    /// Combustion and exhaust-port heat deposited into the metal during this step \[J\].
     pub wall_heat_j: f32,
-    /// Mechanical friction power \[W\].
-    pub friction_power_w: f32,
+    /// Mechanical friction work dissipated during this step \[J\].
+    pub friction_heat_j: f32,
+    /// Mean engine speed \[rpm\].
     pub rpm: f32,
     pub ambient_t: f32,
     /// Ram/test-cell air speed through the radiator before the fan \[m/s\].
@@ -83,12 +118,14 @@ pub(crate) struct ThermalInputs {
     pub thermostat_fault: ThermostatFault,
     /// Coolant loss from damage (fraction of fill per second).
     pub coolant_leak_per_s: f32,
+    /// Mean exhaust mass flow through the catalyst \[kg/s\].
     pub exhaust_mass_flow: f32,
+    /// Mass-flow-weighted mean catalyst inlet temperature \[K\].
     pub exhaust_temp: f32,
     /// Catalytic exotherm deposited during this step \[J\].
     pub catalyst_exotherm_j: f32,
-    /// Heat transferred from the exhaust gas to the manifold wall \[W\].
-    pub manifold_heat_w: f32,
+    /// Heat transferred from the exhaust gas to the manifold wall during this step \[J\].
+    pub manifold_heat_j: f32,
     pub cylinders: usize,
 }
 
@@ -138,8 +175,8 @@ impl ThermalModel {
         };
         st.thermostat_pos = approach(st.thermostat_pos, thermostat_target, dt, THERMOSTAT_TAU_S);
 
-        // Radiator as a heat exchanger, ε–NTU method with C_r → 0 (conservative):
-        // ε = 1 − exp(−UA/C_min), Q = ε·C_min·(T_coolant − T_ambient).
+        // Radiator as a cross-flow heat exchanger (ε–NTU): NTU = UA/C_min,
+        // Q = ε(NTU, C_min/C_max)·C_min·(T_coolant − T_ambient).
         let mut air_speed = inp.ram_air_speed.max(NATURAL_AIR_SPEED);
         if inp.fan_on {
             air_speed = air_speed.max(FAN_AIR_SPEED);
@@ -149,8 +186,11 @@ impl ThermalModel {
         let c_air = AIR_DENSITY * s.radiator_area_m2 * air_speed * CP_AIR;
         let c_cool = pump_flow * st.thermostat_pos * level * CP_COOLANT;
         let c_min = c_air.min(c_cool);
+        let c_max = c_air.max(c_cool);
         let q_rad = if c_min > 1.0e-3 {
-            (1.0 - (-ua_rad / c_min).exp()) * c_min * (st.t_coolant - t_amb)
+            crossflow_unmixed_effectiveness(ua_rad / c_min, c_min / c_max)
+                * c_min
+                * (st.t_coolant - t_amb)
         } else {
             0.0
         };
@@ -160,11 +200,23 @@ impl ThermalModel {
         let q_ma = s.metal_ambient_ua * (1.0 + 0.1 * air_speed) * (st.t_metal - t_amb);
         let q_oa = s.oil_ambient_ua * (1.0 + 0.08 * air_speed) * (st.t_oil - t_amb);
 
-        let p_f = inp.friction_power_w.max(0.0);
-        st.t_metal += (inp.wall_heat_j + ((1.0 - FRICTION_TO_OIL) * p_f - q_mc - q_mo - q_ma) * dt)
+        // Piston crowns cool into the oil (ring pack, skirt, oil jets); that heat is one of
+        // the oil's main sources at load.
+        let k_p = (s.piston_cooling_ua * dt / s.piston_capacity).min(1.0);
+        let n = inp.cylinders.min(MAX_CYLINDERS);
+        let mut piston_to_oil_j = 0.0;
+        for t in &mut st.t_piston[..n] {
+            let d = k_p * (*t - st.t_oil);
+            *t -= d;
+            piston_to_oil_j += d * s.piston_capacity;
+        }
+
+        let e_f = inp.friction_heat_j.max(0.0);
+        st.t_metal += (inp.wall_heat_j.max(0.0) + (1.0 - FRICTION_TO_OIL) * e_f
+            - (q_mc + q_mo + q_ma) * dt)
             / s.metal_capacity;
         st.t_coolant += (q_mc - q_rad) * dt / (s.coolant_capacity * level.max(0.05));
-        st.t_oil += (FRICTION_TO_OIL * p_f + q_mo - q_oa) * dt / s.oil_capacity;
+        st.t_oil += (FRICTION_TO_OIL * e_f + piston_to_oil_j + (q_mo - q_oa) * dt) / s.oil_capacity;
 
         // Coolant inventory: boil-over through the expansion tank and damage leaks.
         let mut loss = inp.coolant_leak_per_s.max(0.0);
@@ -173,18 +225,20 @@ impl ThermalModel {
         }
         st.coolant_level = clampf(level - loss * dt, 0.0, 1.0);
 
-        // Piston crowns cool into the oil (ring pack, skirt, oil jets).
-        let k_p = s.piston_cooling_ua * dt / s.piston_capacity;
-        let n = inp.cylinders.min(MAX_CYLINDERS);
-        for t in &mut st.t_piston[..n] {
-            *t -= k_p * (*t - st.t_oil);
-        }
-
-        // Catalyst: convective heating by the exhaust (h ∝ ṁ^0.8 through the monolith
-        // channels), exotherm from oxidising HC/CO, and shell losses to ambient.
-        let ua_cat = 100.0 * (inp.exhaust_mass_flow.max(0.0) / 0.02).powf(0.8);
-        let q_cat = ua_cat * (inp.exhaust_temp - st.t_catalyst)
-            - 4.0 * (1.0 + 0.15 * air_speed) * (st.t_catalyst - t_amb);
+        // Catalyst: convective exchange with the exhaust (h ∝ ṁ^0.8 through the monolith
+        // channels), exotherm from oxidising HC/CO, and shell losses to ambient. The gas
+        // can at most reach the substrate temperature, so the exchange is capped by the
+        // ε–NTU effectiveness of the monolith against the gas capacity rate (the substrate
+        // is the C_r → 0 side): Q = ṁ·c_p·(1 − exp(−UA/(ṁ·c_p)))·(T_gas − T_cat).
+        let mdot = inp.exhaust_mass_flow.max(0.0);
+        let c_gas = mdot * CP_EXHAUST;
+        let q_gas = if c_gas > 1.0e-6 {
+            let ua_cat = CATALYST_UA_REF * (mdot / 0.02).powf(0.8);
+            c_gas * (1.0 - (-ua_cat / c_gas).exp()) * (inp.exhaust_temp - st.t_catalyst)
+        } else {
+            0.0
+        };
+        let q_cat = q_gas - CATALYST_SHELL_UA * (1.0 + 0.15 * air_speed) * (st.t_catalyst - t_amb);
         st.t_catalyst += (q_cat * dt + inp.catalyst_exotherm_j.max(0.0)) / s.catalyst_capacity;
 
         // Exhaust manifold wall: heated by the gas, cooled by convection and by radiation
@@ -192,7 +246,7 @@ impl ThermalModel {
         let tm = st.t_manifold;
         let q_rad = MANIFOLD_EMISSIVE_AREA * STEFAN_BOLTZMANN * (tm.powi(4) - t_amb.powi(4));
         let q_conv = MANIFOLD_CONVECTION_UA * (1.0 + 0.08 * air_speed) * (tm - t_amb);
-        st.t_manifold += (inp.manifold_heat_w - q_rad - q_conv) * dt / MANIFOLD_CAPACITY;
+        st.t_manifold += (inp.manifold_heat_j - (q_rad + q_conv) * dt) / MANIFOLD_CAPACITY;
     }
 }
 
@@ -205,7 +259,7 @@ mod tests {
     fn idle_warm_up_reaches_thermostat_and_regulates() {
         let model = ThermalModel::new(&ThermalSpec::two_litre());
         let mut st = ThermalState::uniform(293.0);
-        let dt = 0.01;
+        let dt = THERMAL_STEP_S;
         // ≈ 6 kW of combustion heat to the walls and 1.5 kW of friction at idle.
         for _ in 0..(1800.0 / dt) as usize {
             let fan_on = st.t_coolant > 373.0;
@@ -213,7 +267,7 @@ mod tests {
                 &mut st,
                 &ThermalInputs {
                     wall_heat_j: 6000.0 * dt,
-                    friction_power_w: 1500.0,
+                    friction_heat_j: 1500.0 * dt,
                     rpm: 800.0,
                     ambient_t: 293.0,
                     ram_air_speed: 0.0,
@@ -223,7 +277,7 @@ mod tests {
                     exhaust_mass_flow: 0.004,
                     exhaust_temp: 700.0,
                     catalyst_exotherm_j: 0.0,
-                    manifold_heat_w: 0.0,
+                    manifold_heat_j: 0.0,
                     cylinders: 4,
                 },
                 dt,

@@ -21,7 +21,7 @@ pub enum Fault {
         /// Offset \[K\]; negative reads colder than reality.
         kelvin: f32,
     },
-    /// Intake air temperature sensor open circuit (reads −40 °C).
+    /// Intake air temperature sensor open circuit (reads −50 °C, below the sensor range).
     IntakeAirSensorOpen,
     /// Ageing wide-band O2 sensor with a slow response.
     OxygenSensorSlow {
@@ -182,8 +182,11 @@ impl Fault {
 pub enum FaultError {
     /// Cylinder index outside the engine.
     InvalidCylinder,
-    /// Parameter outside its physical range or not finite.
+    /// Parameter outside its physical range, not finite, or so mild that nothing would
+    /// change (a fault must be detectable).
     InvalidParameter,
+    /// The fault needs hardware this engine does not have (turbo faults on an NA engine).
+    NotApplicable,
 }
 
 impl fmt::Display for FaultError {
@@ -191,6 +194,7 @@ impl fmt::Display for FaultError {
         match self {
             Self::InvalidCylinder => write!(f, "cylinder index outside the engine"),
             Self::InvalidParameter => write!(f, "fault parameter out of range"),
+            Self::NotApplicable => write!(f, "fault does not apply to this engine"),
         }
     }
 }
@@ -258,8 +262,10 @@ fn hole_area(d_mm: f32) -> f32 {
     PI / 4.0 * d * d
 }
 
-fn check(v: f32, lo: f32, hi: f32) -> Result<f32, FaultError> {
-    if v.is_finite() && v >= lo && v <= hi {
+/// Accepts `v` within `[lo, hi]` but different from the healthy value `neutral`, which
+/// would make the fault invisible while still reporting it as active.
+fn check(v: f32, lo: f32, hi: f32, neutral: f32) -> Result<f32, FaultError> {
+    if v.is_finite() && v >= lo && v <= hi && v != neutral {
         Ok(v)
     } else {
         Err(FaultError::InvalidParameter)
@@ -267,8 +273,14 @@ fn check(v: f32, lo: f32, hi: f32) -> Result<f32, FaultError> {
 }
 
 impl FaultState {
-    /// Applies a fault. `cylinders` bounds cylinder-specific faults.
-    pub(crate) fn apply(&mut self, fault: Fault, cylinders: usize) -> Result<(), FaultError> {
+    /// Applies a fault. `cylinders` bounds cylinder-specific faults; turbo faults require
+    /// `turbocharged`. Rejected faults leave the state unchanged.
+    pub(crate) fn apply(
+        &mut self,
+        fault: Fault,
+        cylinders: usize,
+        turbocharged: bool,
+    ) -> Result<(), FaultError> {
         let cyl = |c: u8| -> Result<usize, FaultError> {
             let c = usize::from(c);
             if c < cylinders {
@@ -277,48 +289,74 @@ impl FaultState {
                 Err(FaultError::InvalidCylinder)
             }
         };
+        let turbo_only = || {
+            if turbocharged {
+                Ok(())
+            } else {
+                Err(FaultError::NotApplicable)
+            }
+        };
         match fault {
-            Fault::MapSensorBias { kpa } => self.map_bias_pa = check(kpa, -100.0, 100.0)? * 1000.0,
+            Fault::MapSensorBias { kpa } => {
+                self.map_bias_pa = check(kpa, -100.0, 100.0, 0.0)? * 1000.0;
+            }
             Fault::CoolantSensorBias { kelvin } => {
-                self.coolant_sensor_bias_k = check(kelvin, -80.0, 80.0)?
+                self.coolant_sensor_bias_k = check(kelvin, -80.0, 80.0, 0.0)?;
             }
             Fault::IntakeAirSensorOpen => self.iat_open_circuit = true,
-            Fault::OxygenSensorSlow { factor } => self.o2_lag_factor = check(factor, 1.0, 50.0)?,
-            Fault::OxygenSensorBias { lambda } => self.o2_bias_lambda = check(lambda, -0.5, 0.5)?,
+            Fault::OxygenSensorSlow { factor } => {
+                self.o2_lag_factor = check(factor, 1.0, 50.0, 1.0)?;
+            }
+            Fault::OxygenSensorBias { lambda } => {
+                self.o2_bias_lambda = check(lambda, -0.5, 0.5, 0.0)?;
+            }
             Fault::KnockSensorDead => self.knock_sensor_dead = true,
             Fault::VacuumLeak { diameter_mm } => {
-                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 30.0)?);
+                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 30.0, 0.0)?);
             }
             Fault::InjectorClogged {
                 cylinder,
                 flow_fraction,
             } => {
-                self.injector_flow[cyl(cylinder)?] = check(flow_fraction, 0.0, 1.0)?;
+                let c = cyl(cylinder)?;
+                self.injector_flow[c] = check(flow_fraction, 0.0, 1.0, 1.0)?;
             }
             Fault::IgnitionCoilWeak { cylinder, strength } => {
-                self.coil_strength[cyl(cylinder)?] = check(strength, 0.0, 1.0)?;
+                let c = cyl(cylinder)?;
+                self.coil_strength[c] = check(strength, 0.0, 1.0, 1.0)?;
             }
-            Fault::ThermostatStuckOpen => self.thermostat = ThermostatFault::StuckOpen,
-            Fault::ThermostatStuckClosed => self.thermostat = ThermostatFault::StuckClosed,
+            Fault::ThermostatStuckOpen => {
+                self.thermostat = ThermostatFault::StuckOpen;
+                self.active &= !(1 << (FaultId::ThermostatStuckClosed as u8));
+            }
+            Fault::ThermostatStuckClosed => {
+                self.thermostat = ThermostatFault::StuckClosed;
+                self.active &= !(1 << (FaultId::ThermostatStuckOpen as u8));
+            }
             Fault::TimingChainStretch { retard_deg } => {
-                self.cam_retard_deg = check(retard_deg, 0.0, 30.0)?
+                self.cam_retard_deg = check(retard_deg, 0.0, 30.0, 0.0)?;
             }
             Fault::FuelPumpWeak { capacity_fraction } => {
-                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 1.0)?;
+                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 1.0, 1.0)?;
             }
             Fault::ExhaustRestriction { factor } => {
-                self.exhaust_restriction = check(factor, 1.0, 50.0)?
+                self.exhaust_restriction = check(factor, 1.0, 50.0, 1.0)?;
             }
             Fault::LowCompression {
                 cylinder,
                 leak_fraction,
             } => {
-                self.compression_leak[cyl(cylinder)?] = check(leak_fraction, 0.0, 1.0)?;
+                let c = cyl(cylinder)?;
+                self.compression_leak[c] = check(leak_fraction, 0.0, 1.0, 0.0)?;
             }
             Fault::BoostLeak { diameter_mm } => {
-                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 40.0)?);
+                turbo_only()?;
+                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 40.0, 0.0)?);
             }
-            Fault::WastegateStuckClosed => self.wastegate_stuck_closed = true,
+            Fault::WastegateStuckClosed => {
+                turbo_only()?;
+                self.wastegate_stuck_closed = true;
+            }
         }
         self.active |= 1 << (fault.id() as u8);
         Ok(())
@@ -343,7 +381,8 @@ mod tests {
                     cylinder: 2,
                     flow_fraction: 0.6
                 },
-                4
+                4,
+                false
             )
             .is_ok());
         assert_eq!(f.injector_flow[2], 0.6);
@@ -354,7 +393,8 @@ mod tests {
                     cylinder: 5,
                     flow_fraction: 0.6
                 },
-                4
+                4,
+                false
             ),
             Err(FaultError::InvalidCylinder)
         );
@@ -363,9 +403,41 @@ mod tests {
                 Fault::VacuumLeak {
                     diameter_mm: f32::NAN
                 },
-                4
+                4,
+                false
             ),
             Err(FaultError::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn undetectable_or_inapplicable_faults_are_rejected() {
+        let mut f = FaultState::default();
+        // Neutral severities would report an active fault that changes nothing.
+        assert_eq!(
+            f.apply(Fault::VacuumLeak { diameter_mm: 0.0 }, 4, false),
+            Err(FaultError::InvalidParameter)
+        );
+        assert_eq!(
+            f.apply(Fault::OxygenSensorSlow { factor: 1.0 }, 4, false),
+            Err(FaultError::InvalidParameter)
+        );
+        // Turbo hardware faults on a naturally aspirated engine.
+        assert_eq!(
+            f.apply(Fault::BoostLeak { diameter_mm: 20.0 }, 4, false),
+            Err(FaultError::NotApplicable)
+        );
+        assert_eq!(
+            f.apply(Fault::WastegateStuckClosed, 4, false),
+            Err(FaultError::NotApplicable)
+        );
+        assert!(f.apply(Fault::WastegateStuckClosed, 4, true).is_ok());
+        assert!(!f.is_active(FaultId::BoostLeak));
+        // The two thermostat modes are mutually exclusive.
+        f.apply(Fault::ThermostatStuckOpen, 4, false).unwrap();
+        f.apply(Fault::ThermostatStuckClosed, 4, false).unwrap();
+        assert!(f.is_active(FaultId::ThermostatStuckClosed));
+        assert!(!f.is_active(FaultId::ThermostatStuckOpen));
+        assert_eq!(f.thermostat, ThermostatFault::StuckClosed);
     }
 }

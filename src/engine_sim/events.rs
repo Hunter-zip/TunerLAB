@@ -35,10 +35,16 @@ pub struct DiagnosticEvent {
 }
 
 /// Ring buffer of the most recent diagnostic events.
+///
+/// Sequence numbers are monotonic for the lifetime of the simulation, including across
+/// [`EngineSim::reset`](super::EngineSim::reset), so a consumer's stored cursor stays valid:
+/// a reset only discards the events logged before it.
 #[derive(Debug, Clone)]
 pub struct EventLog {
     buf: [DiagnosticEvent; EVENT_LOG_CAPACITY],
     next_seq: u64,
+    /// Events with a lower sequence number were discarded by a reset.
+    first_seq: u64,
 }
 
 impl Default for EventLog {
@@ -50,6 +56,7 @@ impl Default for EventLog {
                 kind: EventKind::ConditionChanged(EngineCondition::Off),
             }; EVENT_LOG_CAPACITY],
             next_seq: 0,
+            first_seq: 0,
         }
     }
 }
@@ -73,7 +80,10 @@ impl EventLog {
 
     /// Events with `seq >= from_seq` still held in the ring, oldest first.
     pub fn since(&self, from_seq: u64) -> impl Iterator<Item = &DiagnosticEvent> + '_ {
-        let oldest = self.next_seq.saturating_sub(EVENT_LOG_CAPACITY as u64);
+        let oldest = self
+            .next_seq
+            .saturating_sub(EVENT_LOG_CAPACITY as u64)
+            .max(self.first_seq);
         let start = from_seq.max(oldest);
         (start..self.next_seq).map(move |s| &self.buf[(s % EVENT_LOG_CAPACITY as u64) as usize])
     }
@@ -83,18 +93,29 @@ impl EventLog {
         self.since(0)
     }
 
+    /// Discards every retained event; sequence numbers keep counting.
     pub(crate) fn clear(&mut self) {
-        self.next_seq = 0;
+        self.first_seq = self.next_seq;
     }
 }
 
 /// One combustion (or misfire) event, published for audio synthesis and cycle analysis.
+///
+/// The closed cycle is computed, and the event emitted, at the **start of the compression
+/// stroke** (bottom dead centre). The combustion it describes happens later:
+/// [`time_to_tdc_s`](Self::time_to_tdc_s) gives the delay to firing TDC and
+/// [`time_to_evo_s`](Self::time_to_evo_s) the delay to exhaust valve opening (the exhaust
+/// pulse), both at the engine speed of the event. Schedule sounds with these offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct CylinderEvent {
     /// Monotonic sequence number.
     pub seq: u64,
-    /// Simulation time \[s\].
+    /// Simulation time at which the cycle was computed (start of compression) \[s\].
     pub time_s: f64,
+    /// Delay from `time_s` to this cylinder's firing TDC \[s\].
+    pub time_to_tdc_s: f32,
+    /// Delay from `time_s` to exhaust valve opening (start of the exhaust pulse) \[s\].
+    pub time_to_evo_s: f32,
     /// Zero-based cylinder index.
     pub cylinder: u8,
     /// Engine speed at the event \[rpm\].
@@ -109,7 +130,8 @@ pub struct CylinderEvent {
     pub misfire: bool,
     /// Net indicated work of the closed cycle \[J\].
     pub indicated_work_j: f32,
-    /// Exhaust gas temperature leaving the port \[K\].
+    /// Mass-averaged exhaust gas temperature at the exhaust valve, before the port heat
+    /// loss \[K\].
     pub exhaust_temp_k: f32,
     /// Energy released by afterburning in the exhaust manifold \[J\] ("pops & bangs").
     pub afterburn_j: f32,
@@ -117,11 +139,13 @@ pub struct CylinderEvent {
     pub blowdown_pressure_bar: f32,
 }
 
-/// Ring buffer of recent combustion events.
+/// Ring buffer of recent combustion events. Sequence numbers are monotonic across resets,
+/// as for [`EventLog`].
 #[derive(Debug, Clone)]
 pub struct CylinderEventRing {
     buf: [CylinderEvent; CYLINDER_EVENT_CAPACITY],
     next_seq: u64,
+    first_seq: u64,
 }
 
 impl Default for CylinderEventRing {
@@ -129,6 +153,7 @@ impl Default for CylinderEventRing {
         Self {
             buf: [CylinderEvent::default(); CYLINDER_EVENT_CAPACITY],
             next_seq: 0,
+            first_seq: 0,
         }
     }
 }
@@ -148,14 +173,23 @@ impl CylinderEventRing {
 
     /// Events with `seq >= from_seq` still held in the ring, oldest first.
     pub fn since(&self, from_seq: u64) -> impl Iterator<Item = &CylinderEvent> + '_ {
-        let oldest = self.next_seq.saturating_sub(CYLINDER_EVENT_CAPACITY as u64);
+        let oldest = self
+            .next_seq
+            .saturating_sub(CYLINDER_EVENT_CAPACITY as u64)
+            .max(self.first_seq);
         let start = from_seq.max(oldest);
         (start..self.next_seq)
             .map(move |s| &self.buf[(s % CYLINDER_EVENT_CAPACITY as u64) as usize])
     }
 
+    /// All retained events, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &CylinderEvent> + '_ {
+        self.since(0)
+    }
+
+    /// Discards every retained event; sequence numbers keep counting.
     pub(crate) fn clear(&mut self) {
-        self.next_seq = 0;
+        self.first_seq = self.next_seq;
     }
 }
 
@@ -174,5 +208,29 @@ mod tests {
         assert_eq!(v[0], 10);
         assert_eq!(*v.last().unwrap(), EVENT_LOG_CAPACITY as u64 + 9);
         assert_eq!(log.since(EVENT_LOG_CAPACITY as u64 + 8).count(), 2);
+    }
+
+    #[test]
+    fn clear_keeps_sequence_monotonic() {
+        let mut log = EventLog::default();
+        for i in 0..5 {
+            log.push(i as f64, EventKind::Warning(Warning::Knock));
+        }
+        let cursor = log.next_seq();
+        log.clear();
+        assert_eq!(log.iter().count(), 0);
+        log.push(9.0, EventKind::Warning(Warning::Misfire));
+        let new: Vec<u64> = log.since(cursor).map(|e| e.seq).collect();
+        assert_eq!(new, vec![5]);
+
+        let mut ring = CylinderEventRing::default();
+        for _ in 0..3 {
+            ring.push(CylinderEvent::default());
+        }
+        let cursor = ring.next_seq();
+        ring.clear();
+        ring.push(CylinderEvent::default());
+        assert_eq!(ring.since(cursor).count(), 1);
+        assert_eq!(ring.iter().count(), 1);
     }
 }

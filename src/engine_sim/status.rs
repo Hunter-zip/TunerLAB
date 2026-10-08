@@ -71,13 +71,14 @@ impl FailureCause {
 /// High-level operating condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EngineCondition {
-    /// Ignition off, crankshaft at rest.
+    /// Ignition off (the crankshaft may still be spinning down).
     Off,
     /// Starter motor turning the engine.
     Cranking,
     /// Self-sustained combustion.
     Running,
-    /// Ignition on but the engine is not turning (stalled or not yet started).
+    /// Ignition on but the engine is not running: stalled, stopping, or not yet started
+    /// (the crankshaft may still be spinning down).
     Stalled,
     /// Destroyed; requires [`EngineSim::repair`](super::EngineSim::repair).
     Failed(FailureCause),

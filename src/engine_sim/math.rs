@@ -41,16 +41,38 @@ pub(crate) fn lag_alpha(dt: f32, tau: f32) -> f32 {
     }
 }
 
-/// Advances a first-order lag towards `target` (see [`lag_alpha`]).
+/// Magnitude below which a decaying state is snapped to its target / to zero. Without it
+/// exponential decays end in subnormal numbers, whose arithmetic takes a microcode slow
+/// path on x86 and would slow every later step of a stopped engine several-fold.
+const SNAP_EPSILON: f32 = 1.0e-30;
+
+/// Advances a first-order lag towards `target` (see [`lag_alpha`]), landing exactly on the
+/// target once the remaining gap is negligible.
 #[inline]
 pub(crate) fn approach(current: f32, target: f32, dt: f32, tau: f32) -> f32 {
-    current + (target - current) * lag_alpha(dt, tau)
+    let next = current + (target - current) * lag_alpha(dt, tau);
+    if (next - target).abs() <= SNAP_EPSILON * (1.0 + target.abs()) {
+        target
+    } else {
+        next
+    }
 }
 
-/// Linear interpolation.
+/// Flushes a negligible magnitude to exactly zero (see [`SNAP_EPSILON`]).
+#[inline]
+pub(crate) fn flush_tiny(x: f32) -> f32 {
+    if x.abs() < SNAP_EPSILON {
+        0.0
+    } else {
+        x
+    }
+}
+
+/// Linear interpolation in the weighted form `a·(1 − t) + b·t`, which (unlike
+/// `a + (b − a)·t`) cannot overflow for finite `a`, `b` and `t ∈ [0, 1]`.
 #[inline]
 pub(crate) fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
+    a * (1.0 - t) + b * t
 }
 
 /// Hermite smoothstep: C¹-continuous 0→1 transition between `e0` and `e1`. Used wherever a
@@ -163,6 +185,17 @@ mod tests {
         let var = s2 / f64::from(n) - mean * mean;
         assert!(mean.abs() < 0.03);
         assert!((var - 1.0).abs() < 0.05, "var {var}");
+    }
+
+    #[test]
+    fn decays_end_at_exact_zero() {
+        let mut x = 1.0_f32;
+        for _ in 0..200_000 {
+            x = approach(x, 0.0, 2.5e-4, 0.01);
+        }
+        assert_eq!(x, 0.0);
+        assert_eq!(flush_tiny(1.0e-35), 0.0);
+        assert_eq!(flush_tiny(-2.0), -2.0);
     }
 
     #[test]
