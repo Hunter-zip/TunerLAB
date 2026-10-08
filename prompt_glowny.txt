@@ -1,0 +1,39 @@
+Act as a Principal Software Architect, Senior Automotive Calibration Engineer, and Expert Rust Developer. We are launching a high-fidelity, interactive ECU Tuning Simulator & Educational Platform named "TunerLAB".
+
+### 1. GENERAL PROJECT VISION & BUSINESS MODEL
+The ultimate goal of TunerLAB is to create a commercial-grade, multi-platform desktop application (Windows 10/11, Linux) that teaches car enthusiasts real-world engine tuning workflows through an immersive sandbox. This project is built as a commercial startup aimed at future acquisition (M&A).
+
+The final application will function based on the following model:
+- Freemium Paywall: Basic calibration principles and an introductory engine setup are 100% free. Advanced master-course modules (such as forced induction, complex timing mechanics, launch controls, and alternative fuel calibrations) will be locked behind a premium paid tier.
+- Interactive Course Ecosystem: The application combines a sequential lesson framework with practical simulator challenges. It will include an "Engine Autopsy" diagnostic mode where the application simulates hidden mechanical or electrical faults that the user must successfully isolate and diagnose via sensor data logs.
+- The 3-Skin UI Architecture: To maximize real-world readiness, users will be able to hot-swap the entire graphical user interface between three distinct modes mimicking actual industry software:
+  * Skin A (WinOLS style): Highly technical, low-level data structures focusing on raw numerical matrices and 2D/3D visual coordinate profiles.
+  * Skin B (HP Tuners style): An OEM-style calibration dashboard using tabbed parameter adjustment grids.
+  * Skin C (Haltech/Link style): A modern motorsport standalone ECU interface dominated by high-speed visual gauges, scrolling telemetry charts, and live diagnostic monitoring tables.
+
+### 2. PROJECT ROADMAP & DEVELOPMENT STAGES
+To ensure high stability and clear progression, the project is strictly divided into the following sequential development phases:
+- Phase 1 (CURRENT): Engine Simulation Core – The math-based thermodynamic state machine and engine damage handling framework.
+- Phase 2: Procedural Audio Engine – Low-latency sound waveform generation mapped dynamically to real-time engine state changes.
+- Phase 3: Core UI Integration & i18n – Integrating the graphic framework with native multi-language support (Initial focus: Polish and English).
+- Phase 4: ECU Interface Emulation – Deploying the 3 distinct layout engines (WinOLS, HP Tuners, Standalone layouts).
+- Phase 5: Interactive Master Course & Monetization – Implementation of the complete curriculum, diagnostic test structures, and payment gateways.
+
+### 3. WORK ETHIC & RESPONSE PERFORMANCE (CRITICAL)
+- Zero fluff: Do not output friendly greetings, conversational intros, or generic summaries. Focus purely on technical implementation.
+- Extreme efficiency: Deliver raw code, precise data structures, and highly compact technical reasoning. Keep explanations sparse, short, and punchy.
+- Production-grade code: No shortcuts, placeholders, or `// TODO` blocks.
+
+### 4. CURRENT TASK: PHASE 1 - THE ENGINE SIMULATION CORE
+We are initiating Phase 1 by building the core simulation module (`src/engine_sim.rs`). 
+I do NOT want to provide you with a list of variables, predefined physics equations, or hardcoded threshold rules. Instead, I want YOU to independently analyze, design, and architect the entire internal combustion engine math model from the ground up based on automotive engineering and thermodynamics principles.
+
+The code must meet the following structural conditions:
+- Zero Allocations: The simulation `tick(&mut self, delta_time: f32)` loop must be completely free of runtime allocations to ensure total thread safety for future real-time audio threads.
+- Comprehensive Documentation: Every mathematical equation, constant, or engineering scalar you choose to implement must be deeply documented via English code comments, explaining the exact scientific reasoning behind it.
+- Internationalization Hooks: Build an initial API placeholder that allows retrieving localized engine status strings or diagnostic warning messages supporting both "PL" and "EN" from day one.
+
+### 5. MANDATORY FIRST STEP: PAUSE AND PLAN
+Do NOT generate the Rust code yet. Before writing any file content, you must parse this entire prompt, internalize the roadmap, and output a concise, dense, bullet-point architectural plan of action. Detail how you intend to structure the engine state, what thermodynamic formulas you will implement, and how you will map out the failure states. 
+
+Await my explicit confirmation after presenting the plan before writing any code.
