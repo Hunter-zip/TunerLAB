@@ -168,6 +168,9 @@ impl ThermalModel {
             * if boiling { FILM_BOILING_FACTOR } else { 1.0 };
         let q_mc = ua_mc * (st.t_metal - st.t_coolant);
         let q_mo = s.metal_oil_ua * (1.0 + rpm / 3000.0) * (st.t_metal - st.t_oil);
+        // Oil/coolant plate exchanger: both pumps are engine driven, so its conductance
+        // follows the same forced-convection flow factor as the coolant jacket.
+        let q_oc = s.oil_cooler_ua * flow_factor * level.max(0.05) * (st.t_oil - st.t_coolant);
 
         // Thermostat: wax element opening between start and full temperatures.
         let thermostat_target = match inp.thermostat_fault {
@@ -219,8 +222,9 @@ impl ThermalModel {
         st.t_metal += (inp.wall_heat_j.max(0.0) + (1.0 - FRICTION_TO_OIL) * e_f
             - (q_mc + q_mo + q_ma) * dt)
             / s.metal_capacity;
-        st.t_coolant += (q_mc - q_rad) * dt / (s.coolant_capacity * level.max(0.05));
-        st.t_oil += (FRICTION_TO_OIL * e_f + piston_to_oil_j + (q_mo - q_oa) * dt) / s.oil_capacity;
+        st.t_coolant += (q_mc + q_oc - q_rad) * dt / (s.coolant_capacity * level.max(0.05));
+        st.t_oil +=
+            (FRICTION_TO_OIL * e_f + piston_to_oil_j + (q_mo - q_oa - q_oc) * dt) / s.oil_capacity;
 
         // Coolant inventory: boil-over through the expansion tank and damage leaks.
         let mut loss = inp.coolant_leak_per_s.max(0.0);

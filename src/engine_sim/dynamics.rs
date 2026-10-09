@@ -116,6 +116,8 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
     if !matches!(load, LoadModel::Dyno(_)) {
         st.dyno_engaged = false;
     }
+    // `true` when the net force on a stopped car exceeds its resistance backwards.
+    let mut car_pushed_back = false;
     // (torque acting on the crank, measured load torque)
     let (t_crank, t_measured) = match load {
         LoadModel::Neutral => {
@@ -187,9 +189,11 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
             } else {
                 // Series stiffness referred to the crank: k = 1/(1/k_clutch + i²/k_wheel).
                 // The referred vehicle inertia J_v = m·r²/i² and the crank inertia set the
-                // damping for a constant damping ratio, c = 2ζ·√(k·J_red). Both the mode
-                // frequency (≤ √(k_wheel/(m·r²)) ≤ 100 rad/s for any sanitised vehicle) and
-                // c·dt/J stay far inside the explicit-integration limits.
+                // damping for a constant damping ratio, c = 2ζ·√(k·J_red). The mode
+                // frequency obeys ω² = k·(1/J_e + 1/J_v) ≤ k_clutch/J_e + k_wheel/(m·r²)
+                // ≤ 600/0.01 + 10⁴/(100·0.1²) = 7·10⁴ for any validated engine and
+                // sanitised vehicle, so ω ≤ 265 rad/s, ω·dt ≤ 0.066 and the damping step
+                // 2ζω·dt ≤ 0.027: far inside the explicit-integration limits.
                 let i2 = ratio * ratio;
                 let k = 1.0 / (1.0 / CLUTCH_DAMPER_STIFFNESS + i2 / WHEEL_SIDE_STIFFNESS);
                 let j_v = v.mass_kg * v.wheel_radius_m * v.wheel_radius_m / i2;
@@ -226,12 +230,15 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
             } else {
                 let accel = (net_push - f_resist - f_aero) / v.mass_kg;
                 st.vehicle_speed = (speed + accel * dt).max(0.0);
+                car_pushed_back = st.vehicle_speed <= 0.0 && net_push < -f_resist;
             }
             (t_cl, t_cl)
         }
     };
     st.load_torque = t_measured;
 
+    // `true` when the net torque on a stopped crank exceeds static friction backwards.
+    let mut pushed_back = false;
     if inp.seized {
         st.omega = approach(omega, 0.0, dt, 0.02);
     } else {
@@ -245,15 +252,18 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
             // Kinetic friction always opposes forward rotation; the crank cannot run
             // backwards (in reality the engine rocks back by a fraction of a revolution).
             st.omega = (omega + (drive - resist) / j * dt).max(0.0);
+            pushed_back = st.omega <= 0.0 && drive < -resist;
         }
     }
     if st.dyno_engaged {
         st.coupling_twist += (st.omega - st.dyno_omega) * dt;
     }
     // Wind-up that pushes a stationary end the way it cannot move (crank backwards, car
-    // backwards) is released: the crank rocks back, the car settles on its tyres.
+    // backwards) is released: the crank rocks back, the car settles on its tyres. Wind-up
+    // balanced by static friction (the starter or the engine pushing against a braked car,
+    // a car parked in gear held by compression) is a static equilibrium and stays.
     let spring = st.driveline_spring_nm;
-    if (spring > 0.0 && st.omega <= 0.0) || (spring < 0.0 && st.vehicle_speed <= 0.0) {
+    if (spring > 0.0 && pushed_back) || (spring < 0.0 && car_pushed_back) {
         st.driveline_spring_nm = approach(spring, 0.0, dt, DRIVELINE_RELAX_TAU_S);
     }
     st.theta = wrap_cycle(st.theta + st.omega * dt);
@@ -373,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn stalled_engine_in_gear_does_not_keep_driveline_wind_up() {
+    fn stalled_engine_in_gear_releases_wind_up_down_to_static_friction() {
         let mut st = CrankState {
             omega: 0.0,
             driveline_spring_nm: 200.0,
@@ -389,12 +399,65 @@ mod tests {
         for _ in 0..4000 {
             step(&mut st, &dead, &load, 2.5e-4);
         }
-        assert!(
-            st.driveline_spring_nm.abs() < 1.0,
-            "{}",
-            st.driveline_spring_nm
-        );
+        // The crank rocks back until static friction (30 + 2 N·m) can hold the rest.
+        let spring = st.driveline_spring_nm;
+        assert!((31.0..=32.0).contains(&spring), "{spring}");
         assert_eq!(st.vehicle_speed, 0.0);
+        assert_eq!(st.omega, 0.0);
+    }
+
+    #[test]
+    fn starter_stalls_against_a_braked_car_in_gear() {
+        let mut st = CrankState::default();
+        let load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            brake: 1.0,
+            ..VehicleParams::default()
+        });
+        let mut cranking = inputs(0.0);
+        cranking.starter_torque = 80.0;
+        let mut revs_at_1s = 0.0_f64;
+        let mut revs = 0.0_f64;
+        for i in 0..40_000 {
+            step(&mut st, &cranking, &load, 2.5e-4);
+            revs += f64::from(st.omega) * 2.5e-4 / core::f64::consts::TAU;
+            if i == 4000 {
+                revs_at_1s = revs;
+            }
+        }
+        // Wind-up stalls the starter within the first second; nothing creeps afterwards.
+        assert_eq!(st.omega, 0.0);
+        assert!(revs - revs_at_1s < 1.0e-6, "{revs_at_1s} -> {revs}");
+        assert!(st.driveline_spring_nm > 60.0, "{}", st.driveline_spring_nm);
+        assert_eq!(st.vehicle_speed, 0.0);
+    }
+
+    #[test]
+    fn car_parked_in_gear_does_not_creep() {
+        let mut st = CrankState::default();
+        let load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            grade_rad: -0.15,
+            ..VehicleParams::default()
+        });
+        // A stopped crank held by 40 N·m of compression plus friction.
+        let mut held = inputs(-40.0);
+        held.friction_torque = 20.0;
+        let mut travelled = 0.0_f64;
+        let mut travelled_at_2s = 0.0_f64;
+        for i in 0..80_000 {
+            step(&mut st, &held, &load, 2.5e-4);
+            travelled += f64::from(st.vehicle_speed) * 2.5e-4;
+            if i == 8000 {
+                travelled_at_2s = travelled;
+            }
+        }
+        assert_eq!(st.omega, 0.0);
+        assert_eq!(st.vehicle_speed, 0.0);
+        assert!(
+            travelled - travelled_at_2s < 1.0e-6,
+            "{travelled_at_2s} -> {travelled}"
+        );
     }
 
     #[test]

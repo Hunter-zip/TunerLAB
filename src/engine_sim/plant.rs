@@ -21,6 +21,8 @@ use super::thermo::{
     vogel_viscosity, water_saturation_pressure, CP_AIR, CP_EXHAUST, GAMMA_EXHAUST, R_AIR,
 };
 
+/// Longest firing interval still timed for event prediction (≈ 37 rpm on a four) \[s\].
+const MAX_FIRING_INTERVAL_S: f32 = 0.8;
 /// Normalisation of the per-stroke torque shape `g(x) = sin x · (1 − x/π)³` on [0, π]:
 /// ∫₀^π g dx = (π² − 6)/π² ≈ 0.392. The shape peaks ≈ 40° from TDC, like the measured
 /// gas-torque of a firing cylinder, and its integral equals the stroke work, so the mean
@@ -160,9 +162,13 @@ pub(crate) struct Plant {
     /// Fraction of the last step at which each cylinder that fired this step crossed its
     /// start of compression (for sub-step event time stamps).
     pub fire_fraction: [f32; MAX_CYLINDERS],
-    /// Crank speed averaged over about one engine cycle \[rad/s\]: the speed at which
-    /// the next half revolution will be covered, free of the firing-pulse ripple.
-    pub omega_cycle_mean: f32,
+    /// Durations of the last two firing intervals (between consecutive cylinder events),
+    /// newest first \[s\] (see [`Plant::time_to_turn`]).
+    firing_intervals_s: [f32; 2],
+    /// Number of valid entries in `firing_intervals_s`.
+    intervals_valid: u8,
+    /// Time since the last cylinder event \[s\].
+    since_event_s: f32,
     pub catalyst_efficiency: f32,
     hc_store_j: f32,
     o2_store_kg: f32,
@@ -257,7 +263,9 @@ impl Plant {
             torque: TorqueBreakdown::default(),
             segment: CrankSegment::default(),
             fire_fraction: [0.0; MAX_CYLINDERS],
-            omega_cycle_mean: 0.0,
+            firing_intervals_s: [0.0; 2],
+            intervals_valid: 0,
+            since_event_s: 0.0,
             catalyst_efficiency: 0.0,
             hc_store_j: 0.0,
             o2_store_kg: 0.0,
@@ -291,6 +299,7 @@ impl Plant {
             vehicle_speed: self.crank.vehicle_speed,
             ..CrankState::default()
         };
+        self.intervals_valid = 0;
     }
 
     /// Puts all thermal masses at fully-warm operating temperature.
@@ -326,6 +335,46 @@ impl Plant {
             }
         }
         t
+    }
+
+    /// Books the duration of the firing interval that a cylinder event just closed.
+    fn record_firing_interval(&mut self, duration_s: f32) {
+        if duration_s > MAX_FIRING_INTERVAL_S {
+            self.intervals_valid = 0;
+        } else {
+            self.firing_intervals_s = [duration_s, self.firing_intervals_s[0]];
+            self.intervals_valid = (self.intervals_valid + 1).min(2);
+        }
+    }
+
+    /// Predicted time for the crankshaft to turn through `angle` \[rad\] from the latest
+    /// cylinder event.
+    ///
+    /// Uses the durations of the last two firing intervals, as production ECUs time crank
+    /// segments: the mean speed over a whole interval, ω̄ = (4π/n)/T, carries no
+    /// firing-pulse ripple because the ripple is periodic in the interval, so at steady
+    /// speed the prediction is exact. The two interval means, centred half an interval
+    /// back, give the acceleration α = (ω̄₁ − ω̄₀)/((T₁ + T₀)/2) and the speed at the event
+    /// ω = ω̄₁ + α·T₁/2; the angle then follows φ = ω·t + ½·α·t², solved in the
+    /// cancellation-free form t = 2φ/(ω + √(ω² + 2αφ)). A deceleration that would stop the
+    /// crank short of `angle`, or fewer than two timed intervals (start, very slow
+    /// cranking), falls back to the current speed.
+    pub(crate) fn time_to_turn(&self, angle: f32) -> f32 {
+        let omega_now = self.crank.omega.max(1.0);
+        if self.intervals_valid < 2 {
+            return angle / omega_now;
+        }
+        let interval_angle = CYCLE_RAD / self.cylinders as f32;
+        let [t1, t0] = self.firing_intervals_s;
+        let (w1, w0) = (interval_angle / t1, interval_angle / t0);
+        let alpha = (w1 - w0) / (0.5 * (t1 + t0));
+        let omega = (w1 + alpha * 0.5 * t1).max(1.0);
+        let disc = omega * omega + 2.0 * alpha * angle;
+        if disc > 0.0 {
+            2.0 * angle / (omega + disc.sqrt())
+        } else {
+            angle / omega
+        }
     }
 
     /// Advances the plant by one step.
@@ -459,15 +508,13 @@ impl Plant {
             dt,
         );
         let dtheta = self.crank.omega * dt;
-        // One engine cycle (4π) at the current speed, bounded for standstill.
-        let cycle_s = clampf(CYCLE_RAD / self.omega_cycle_mean.max(1.0), 0.02, 1.0);
-        self.omega_cycle_mean = approach(self.omega_cycle_mean, self.crank.omega, dt, cycle_s);
         if self.crank.omega <= 0.0 {
-            // A stopped crank has no gas-exchange cycle: the last cycle's stored work must
-            // not keep acting as a phantom torque on it.
+            // A stopped crank has no combustion: the last cycle's expansion work must not
+            // keep acting as a phantom forward torque on it. The trapped charge still acts
+            // as a lossless air spring (W_exp = −W_comp, an odd torque about TDC with zero
+            // net work), which is what holds a car parked in gear.
             for cyl in &mut self.cyl[..n] {
-                cyl.work_compression_j = 0.0;
-                cyl.work_expansion_j = 0.0;
+                cyl.work_expansion_j = cyl.work_expansion_j.min(-cyl.work_compression_j);
             }
         }
 
@@ -478,11 +525,15 @@ impl Plant {
                 let event = wrap_cycle(self.tdc_angle[c] - PI);
                 let to_event = wrap_cycle(event - theta_before);
                 if to_event < dtheta {
-                    self.fire_fraction[c] = to_event / dtheta;
+                    let frac = to_event / dtheta;
+                    self.fire_fraction[c] = frac;
+                    self.record_firing_interval(self.since_event_s + frac * dt);
+                    self.since_event_s = -frac * dt;
                     self.fire(c, cmd, ctl, faults, dmg, rng, dry_fraction);
                 }
             }
         }
+        self.since_event_s = (self.since_event_s + dt).min(MAX_FIRING_INTERVAL_S * 2.0);
         self.track_segments(theta_before, dtheta, omega0);
 
         // ---- Catalyst chemistry ---------------------------------------------------------
@@ -567,10 +618,13 @@ impl Plant {
         self.oil_pressure_pa = approach(self.oil_pressure_pa, p_oil_target, dt, 0.15);
         // Fuel dilution: very rich running washes liquid fuel past the rings (cold-start
         // dilution is booked per cycle in `fire`); hot oil boils the light fractions back
-        // out over ≈ 10 minutes.
+        // out over ≈ 10 minutes at 110 °C. Above that the heavier fractions' vapour
+        // pressure (Clausius–Clapeyron, roughly doubling every 15 K) speeds it up.
         let rich = (0.85 - self.exhaust_lambda).max(0.0) / 0.15;
         let wash = 1.2e-5 * self.fuel_mass_flow * 1000.0 * rich;
-        let boil_off = self.oil_dilution * smoothstep(343.0, 383.0, self.thermal.t_oil) / 600.0;
+        let t_oil = self.thermal.t_oil;
+        let volatility = ((t_oil - 383.0).clamp(0.0, 60.0) / 15.0).exp2();
+        let boil_off = self.oil_dilution * smoothstep(343.0, 383.0, t_oil) * volatility / 600.0;
         self.oil_dilution = clampf(self.oil_dilution + (wash - boil_off) * dt, 0.0, 0.15);
 
         // ---- Fuel system ------------------------------------------------------------------

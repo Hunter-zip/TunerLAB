@@ -113,11 +113,11 @@ pub struct CylinderEvent {
     /// Simulation time at which the crank crossed this cylinder's start of compression
     /// (interpolated within the physics step) \[s\].
     pub time_s: f64,
-    /// Predicted delay from `time_s` to this cylinder's firing TDC at the cycle-mean crank
-    /// speed \[s\].
+    /// Predicted delay from `time_s` to this cylinder's firing TDC, extrapolated from the
+    /// ripple-free crank speed and its trend \[s\].
     pub time_to_tdc_s: f32,
-    /// Predicted delay from `time_s` to exhaust valve opening (start of the exhaust pulse)
-    /// at the cycle-mean crank speed \[s\].
+    /// Predicted delay from `time_s` to exhaust valve opening (start of the exhaust pulse),
+    /// extrapolated the same way \[s\].
     pub time_to_evo_s: f32,
     /// Zero-based cylinder index.
     pub cylinder: u8,

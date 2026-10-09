@@ -27,7 +27,8 @@ pub enum CalibrationError {
     /// A table axis is not strictly increasing, contains non-finite values or exceeds
     /// ±10⁶.
     InvalidAxis(&'static str),
-    /// A table value or scalar is not finite or outside its range.
+    /// A table value or scalar is not finite or outside its range, or a finite, increasing
+    /// axis has breakpoints outside its physical range (name ending in `.axis`).
     InvalidValue(&'static str),
 }
 
@@ -784,9 +785,10 @@ impl Calibration {
                 0.01,
                 10.0,
             ),
-            // Fuel must come back above 500 rpm: blames the cut speed of the pair.
+            // Fuel must come back above 500 rpm: the hysteresis, defined relative to the
+            // cut speed, may not exceed cut − 500 rpm.
             (
-                "limiter.cut_rpm",
+                "limiter.hysteresis_rpm",
                 lim.cut_rpm - lim.hysteresis_rpm,
                 500.0,
                 15_000.0,
@@ -906,7 +908,16 @@ impl Calibration {
                 b.base_duty.values_within(0.0, 1.0),
             ),
         ];
-        // Axes with a physical range (battery voltage, pedal travel).
+        for (name, axis_ok, values_ok) in curves {
+            if !axis_ok {
+                return Err(CalibrationError::InvalidAxis(name));
+            }
+            if !values_ok {
+                return Err(CalibrationError::InvalidValue(name));
+            }
+        }
+        // Axes with a physical range (battery voltage, pedal travel), checked once they
+        // are known to be finite and increasing.
         let ranged_axes: [(&'static str, bool); 2] = [
             (
                 "injector.dead_time_ms.axis",
@@ -919,14 +930,6 @@ impl Calibration {
         ];
         for (name, ok) in ranged_axes {
             if !ok {
-                return Err(CalibrationError::InvalidValue(name));
-            }
-        }
-        for (name, axis_ok, values_ok) in curves {
-            if !axis_ok {
-                return Err(CalibrationError::InvalidAxis(name));
-            }
-            if !values_ok {
                 return Err(CalibrationError::InvalidValue(name));
             }
         }
@@ -983,6 +986,39 @@ mod tests {
         let mut c = base;
         c.cranking_pulse_ms.values[0] = 1.0e9;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn axis_errors_name_the_kind_of_fault() {
+        let base = Calibration::base_for(&EngineSpec::naturally_aspirated_2l());
+        // Non-finite or non-increasing breakpoints are axis faults...
+        let mut c = base;
+        c.throttle_map.axis[0] = f32::NAN;
+        assert_eq!(
+            c.validate(),
+            Err(CalibrationError::InvalidAxis("throttle_map"))
+        );
+        let mut c = base;
+        c.injector.dead_time_ms.axis[5] = f32::INFINITY;
+        assert_eq!(
+            c.validate(),
+            Err(CalibrationError::InvalidAxis("injector.dead_time_ms"))
+        );
+        // ...finite, increasing breakpoints beyond the physical range are value faults.
+        let mut c = base;
+        c.throttle_map.axis[7] = 150.0;
+        assert_eq!(
+            c.validate(),
+            Err(CalibrationError::InvalidValue("throttle_map.axis"))
+        );
+        // A hysteresis that would resume fuel below 500 rpm names the hysteresis.
+        let mut c = base;
+        c.limiter.cut_rpm = 3000.0;
+        c.limiter.hysteresis_rpm = 2900.0;
+        assert_eq!(
+            c.validate(),
+            Err(CalibrationError::InvalidValue("limiter.hysteresis_rpm"))
+        );
     }
 
     #[test]

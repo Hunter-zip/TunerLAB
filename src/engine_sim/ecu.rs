@@ -58,21 +58,25 @@ const DASHPOT_TAU_S: f32 = 1.5;
 const DFCO_RESUME_LEAD_S: f32 = 0.15;
 /// Smoothing of the engine acceleration estimate used by the DFCO resume look-ahead \[s\].
 const RPM_RATE_TAU_S: f32 = 0.05;
-/// Barometric pressure is learned from MAP only after the engine has been stopped this
-/// long, so a manifold still in post-stall vacuum is not mistaken for altitude \[s\].
-const BARO_LEARN_STOPPED_S: f32 = 2.0;
-/// Wide-open-throttle intake loss at low speed, used to update the baro estimate while
-/// driving on naturally aspirated engines \[kPa\].
-const BARO_WOT_LOSS_KPA: f32 = 1.0;
+/// MAP is compared with the ECU's ambient-pressure (BARO) sensor only after the engine has
+/// been stopped this long, key-off time included, so the manifold has refilled \[s\].
+const MAP_STANDSTILL_SETTLE_S: f32 = 2.0;
+/// Largest MAP–BARO difference a healthy sensor shows at standstill \[kPa\].
+const MAP_STANDSTILL_TOLERANCE_KPA: f32 = 8.0;
 /// Overboost fuel cut, once triggered, stays latched until the pedal falls below this \[%\].
 const OVERBOOST_RELEASE_PEDAL_PCT: f32 = 20.0;
-/// MAP reading at or below which the sensor circuit is judged shorted low while running
-/// (P0107) \[kPa\] (the 3-bar transfer function bottoms out at 10 kPa). Closed-throttle
-/// overrun can legitimately pull the manifold that low, so the check is suspended there.
-const MAP_LOW_LIMIT_KPA: f32 = 10.5;
-/// The running baro estimate only follows readings this close to it \[kPa\]: slow altitude
-/// changes are tracked, a step offset from a faulty MAP sensor is not learned.
-const BARO_TRACK_WINDOW_KPA: f32 = 5.0;
+/// MAP reading at or below which the sensor circuit is judged shorted low (P0107) \[kPa\].
+/// The manifold of a running engine never falls below ≈ 6 kPa, even on closed-throttle
+/// overrun, so only a circuit fault or a large negative offset drives the reading onto
+/// the 2 kPa output rail.
+const MAP_LOW_LIMIT_KPA: f32 = 3.0;
+/// Upper bound of the in-gear anti-stall idle-air term \[duty\].
+const IDLE_GEAR_LIMIT: f32 = 0.3;
+/// Bleed-off time constant of the in-gear anti-stall term once speed is back \[s\].
+const IDLE_GEAR_BLEED_TAU_S: f32 = 1.0;
+/// Engine cycles after a fuel cut during which the cut gas still dominates the exhaust λ
+/// that the instructor warnings read.
+const CUT_FLUSH_CYCLES: f32 = 2.0;
 /// IAT reading below which the circuit is judged open (the pull-up drives the input to
 /// the cold rail at −50 °C, outside the −40 °C operating range) \[°C\].
 const IAT_OPEN_LIMIT_C: f32 = -45.0;
@@ -166,7 +170,12 @@ pub(crate) struct Ecu {
     dashpot: f32,
     rpm_prev: f32,
     rpm_rate: f32,
+    /// Time the crank has been at rest, key-off time included \[s\].
     stopped_time: f32,
+    /// In-gear anti-stall idle air \[duty\]: only opens, discarded when the driveline opens.
+    idle_int_gear: f32,
+    /// Remaining time during which the exhaust still carries fuel-cut gas \[s\].
+    pub cut_flush_hold: f32,
     /// Idle-valve position the stepper is parked at when the key goes off.
     parked_idle_valve: f32,
     /// Off-idle air consumed since the start (f64: per-step increments are ~10⁻⁶ kg).
@@ -186,7 +195,7 @@ pub(crate) struct Ecu {
     pub rev_cut: bool,
     pub dfco: bool,
     dfco_timer: f32,
-    pub post_cut_hold: f32,
+    post_cut_hold: f32,
     boost_int: f32,
     boost_prev_err: f32,
     pub boost_target_kpa: f32,
@@ -204,7 +213,6 @@ pub(crate) struct Ecu {
     dtc_timers: [f32; DtcCode::COUNT],
     o2_test_timer: f32,
     o2_test_active: bool,
-    baro_kpa: f32,
     pub lambda_target: f32,
     pub ve_value: f32,
     pub spark_mean_deg: f32,
@@ -231,7 +239,10 @@ impl Default for Ecu {
             dashpot: 0.0,
             rpm_prev: 0.0,
             rpm_rate: 0.0,
-            stopped_time: 0.0,
+            // A freshly built engine has been standing for a long time.
+            stopped_time: MAP_STANDSTILL_SETTLE_S,
+            idle_int_gear: 0.0,
+            cut_flush_hold: 0.0,
             parked_idle_valve: 0.0,
             air_since_start_kg: 0.0,
             ect_at_start_c: 0.0,
@@ -265,7 +276,6 @@ impl Default for Ecu {
             dtc_timers: [0.0; DtcCode::COUNT],
             o2_test_timer: 0.0,
             o2_test_active: false,
-            baro_kpa: 101.3,
             lambda_target: 1.0,
             ve_value: 0.0,
             spark_mean_deg: 0.0,
@@ -293,7 +303,7 @@ impl Ecu {
         self.idle_active = false;
         self.rpm_prev = 0.0;
         self.rpm_rate = 0.0;
-        self.stopped_time = 0.0;
+        self.idle_int_gear = 0.0;
         self.air_since_start_kg = 0.0;
         self.thermostat_monitor_pending = false;
         self.film_est = [0.0; MAX_CYLINDERS];
@@ -314,7 +324,9 @@ impl Ecu {
         self.dfco_timer = 0.0;
         self.overboost_cut = false;
         self.post_cut_hold = 0.0;
+        self.cut_flush_hold = 0.0;
         self.dashpot = 0.0;
+        self.idle_int_gear = 0.0;
         self.closed_loop = false;
         self.stft = 0.0;
         self.stft_int = 0.0;
@@ -326,6 +338,15 @@ impl Ecu {
         self.air_per_cylinder_kg = 0.0;
         self.pulse_width_s = 0.0;
         self.injector_duty = 0.0;
+    }
+
+    /// Counts how long the crank has been at rest (through key-off as well).
+    fn track_standstill(&mut self, rpm: f32, dt: f32) {
+        if rpm < 50.0 {
+            self.stopped_time += dt;
+        } else {
+            self.stopped_time = 0.0;
+        }
     }
 
     /// Restarts the OBD monitors' evaluation state (misfire window and trend, O2 test).
@@ -409,28 +430,17 @@ impl Ecu {
             // The unpowered idle stepper stays where the ECU parked it for the next start,
             // so the manifold refills to barometric pressure soon after the engine stops.
             cmd.idle_valve = self.parked_idle_valve;
+            self.track_standstill(s.rpm, dt);
             return cmd;
         }
         let n = cal.engine.cylinders.clamp(1, MAX_CYLINDERS);
-        let key_on = self.mode == EcuMode::Off;
         self.key_on_time += dt;
         let rpm = s.rpm;
-        // Only plausible readings (sea level to ≈ 4500 m) are ever learned as baro.
-        let baro_plausible = (55.0..=110.0).contains(&s.map_kpa);
-        if rpm < 50.0 {
-            // Engine stopped: the MAP sensor reads barometric pressure, sampled at key-on
-            // (the manifold refilled during key-off) and, after a stall with the key on,
-            // once the manifold has had time to refill.
-            if key_on && baro_plausible {
-                self.baro_kpa = s.map_kpa;
-            }
-            self.stopped_time += dt;
-            if self.stopped_time > BARO_LEARN_STOPPED_S && baro_plausible {
-                self.baro_kpa = approach(self.baro_kpa, s.map_kpa, dt, 0.2);
-            }
-        } else {
-            self.stopped_time = 0.0;
-        }
+        self.track_standstill(rpm, dt);
+        // With the engine at rest and the manifold refilled, MAP must agree with the ECU's
+        // own ambient-pressure sensor (MAP rationality at standstill).
+        let standstill_map_mismatch = self.stopped_time > MAP_STANDSTILL_SETTLE_S
+            && (s.map_kpa - s.baro_kpa).abs() > MAP_STANDSTILL_TOLERANCE_KPA;
         // Engine acceleration estimate [rpm/s].
         if self.rpm_prev > 0.0 {
             self.rpm_rate = approach(
@@ -541,6 +551,7 @@ impl Ecu {
                 // Pre-position the idle valve for the next start.
                 cmd.idle_valve = clampf(base_idle_valve + CRANKING_IDLE_AIR, 0.0, 1.0);
                 self.clear_running_outputs();
+                self.monitor(DtcCode::P0106, standstill_map_mismatch, 2.0, dt, now, log);
                 return cmd;
             }
             EcuMode::Cranking => {
@@ -596,8 +607,10 @@ impl Ecu {
         // delay plus response time; closed loop stays frozen meanwhile.
         if self.dfco || self.rev_cut || self.overboost_cut {
             self.post_cut_hold = POST_CUT_CLOSED_LOOP_HOLD_S;
+            self.cut_flush_hold = CUT_FLUSH_CYCLES * cycle_time;
         } else {
             self.post_cut_hold = (self.post_cut_hold - dt).max(0.0);
+            self.cut_flush_hold = (self.cut_flush_hold - dt).max(0.0);
         }
         self.closed_loop = cl.enabled
             && self.post_cut_hold <= 0.0
@@ -710,7 +723,24 @@ impl Ecu {
             self.dashpot = approach(self.dashpot, 0.0, dt, DASHPOT_TAU_S);
         }
         let idle_err = idle_target - rpm;
-        let mut idle_valve = base_idle_valve + self.idle_int + self.dashpot;
+        // In gear with the clutch up the wheels, not the idle valve, hold the engine speed.
+        // The neutral-learned integrator is frozen there; a separate anti-stall term may
+        // only open the valve when the engine is lugged below target, bleeds off once the
+        // speed recovers, and is discarded the moment the clutch or neutral switch opens,
+        // so declutching always lands on the neutral idle air.
+        if driveline_engaged && self.idle_active {
+            if idle_err > 0.0 {
+                self.idle_int_gear =
+                    (self.idle_int_gear + ic.ki * idle_err * dt).min(IDLE_GEAR_LIMIT);
+            } else {
+                self.idle_int_gear = approach(self.idle_int_gear, 0.0, dt, IDLE_GEAR_BLEED_TAU_S);
+            }
+        } else if driveline_engaged {
+            self.idle_int_gear = approach(self.idle_int_gear, 0.0, dt, IDLE_GEAR_BLEED_TAU_S);
+        } else {
+            self.idle_int_gear = 0.0;
+        }
+        let mut idle_valve = base_idle_valve + self.idle_int + self.idle_int_gear + self.dashpot;
         if self.idle_active {
             // Conditional integration (anti-windup): full integral gain close to the target,
             // 25 % outside it, so flare-ups and dips (handled by the bounded P term and
@@ -720,11 +750,7 @@ impl Ecu {
             } else {
                 0.25
             };
-            // In gear with the clutch up the wheels can hold the engine above target while
-            // coasting; the integrator must not wind the valve shut there, or the engine
-            // stalls when the driver declutches. Anti-stall (opening) action stays active.
-            let coasting = driveline_engaged && idle_err < -IDLE_INTEGRATION_BAND_RPM;
-            if !coasting {
+            if !driveline_engaged {
                 self.idle_int = clampf(self.idle_int + gain * ic.ki * idle_err * dt, -0.3, 0.5);
             }
             self.idle_spark = clampf(
@@ -896,22 +922,10 @@ impl Ecu {
         self.monitor(DtcCode::P0299, underboost, 4.0, dt, now, log);
         let rail_low = s.fuel_pressure_kpa < 0.75 * cal.injector.rated_pressure_kpa;
         self.monitor(DtcCode::P0087, rail_low, 2.0, dt, now, log);
-        // Baro tracking at wide-open throttle and low speed, where MAP ≈ baro − intake loss.
-        // Only plausible readings close to the current estimate are followed, and never
-        // while the MAP plausibility monitor is building a case against the sensor.
-        let wot_baro = map_kpa + BARO_WOT_LOSS_KPA;
-        if !turbo
-            && s.throttle_pct > 80.0
-            && rpm < 2500.0
-            && baro_plausible
-            && (wot_baro - self.baro_kpa).abs() < BARO_TRACK_WINDOW_KPA
-            && self.dtc_timers[DtcCode::P0106.index()] == 0.0
-        {
-            self.baro_kpa = approach(self.baro_kpa, wot_baro, dt, 2.0);
-        }
-        let overrun = self.dfco || (pedal < 1.0 && rpm > idle_target + 300.0);
-        let map_implausible = !turbo && map_kpa > self.baro_kpa + 15.0;
-        let idle_map_high = self.idle_active && rpm > 600.0 && map_kpa > 0.85 * self.baro_kpa;
+        // MAP rationality against the ambient-pressure sensor: an NA manifold cannot exceed
+        // ambient, and an idling engine must pull vacuum.
+        let map_implausible = !turbo && map_kpa > s.baro_kpa + 15.0;
+        let idle_map_high = self.idle_active && rpm > 600.0 && map_kpa > 0.85 * s.baro_kpa;
         self.monitor(
             DtcCode::P0106,
             map_implausible || idle_map_high,
@@ -922,7 +936,7 @@ impl Ecu {
         );
         self.monitor(
             DtcCode::P0107,
-            s.map_kpa <= MAP_LOW_LIMIT_KPA && !overrun,
+            s.map_kpa <= MAP_LOW_LIMIT_KPA,
             1.0,
             dt,
             now,

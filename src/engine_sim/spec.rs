@@ -240,6 +240,8 @@ pub struct ThermalSpec {
     pub metal_ambient_ua: f32,
     /// Oil sump→ambient conductance in still air \[W/K\].
     pub oil_ambient_ua: f32,
+    /// Oil→coolant heat-exchanger conductance at 3000 rpm, 0 without an oil cooler \[W/K\].
+    pub oil_cooler_ua: f32,
     /// Thermostat start-to-open temperature \[K\].
     pub thermostat_start_k: f32,
     /// Thermostat fully open temperature \[K\].
@@ -580,6 +582,9 @@ impl EngineSpec {
             ..spec.limits
         };
         spec.thermal.piston_cooling_ua = 24.0; // oil-jet cooled pistons
+                                               // Plate oil/coolant exchanger on the filter housing: ≈ 5 kW at full load with the
+                                               // oil ≈ 25 K above the coolant.
+        spec.thermal.oil_cooler_ua = 200.0;
         spec.turbo = Some(TurboSpec {
             compressor_diameter_m: 0.052,
             turbine_diameter_m: 0.047,
@@ -711,7 +716,7 @@ impl EngineSpec {
         let th = &self.thermal;
         let lub = &self.lubrication;
         let lim = &self.limits;
-        let non_negative: [(&'static str, f32); 20] = [
+        let non_negative: [(&'static str, f32); 21] = [
             ("ram_gain", b.ram_gain),
             ("overlap_loss", b.overlap_loss),
             ("charge_heating", b.charge_heating),
@@ -731,6 +736,7 @@ impl EngineSpec {
             ("metal_oil_ua", th.metal_oil_ua),
             ("metal_ambient_ua", th.metal_ambient_ua),
             ("oil_ambient_ua", th.oil_ambient_ua),
+            ("oil_cooler_ua", th.oil_cooler_ua),
             ("exhaust.backpressure", self.exhaust.backpressure),
             ("valve_contact_margin_rpm", lim.valve_contact_margin_rpm),
             ("bearing_oil_per_krpm", lim.bearing_oil_per_krpm),
@@ -981,6 +987,8 @@ impl ThermalSpec {
             // stagnant under-body air: ≈ 18 W/K together at idle.
             metal_ambient_ua: 10.0,
             oil_ambient_ua: 8.0,
+            // Naturally aspirated small fours rarely carry an oil cooler.
+            oil_cooler_ua: 0.0,
             // 88 °C wax element, fully open at 98 °C.
             thermostat_start_k: 361.15,
             thermostat_full_k: 371.15,

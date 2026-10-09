@@ -29,6 +29,8 @@ const OIL_TEMP_TAU_S: f32 = 5.0;
 const EGT_TAU_S: f32 = 0.7;
 /// MAP sensor + ECU anti-alias filter time constant \[s\].
 const MAP_TAU_S: f32 = 0.003;
+/// Ambient-pressure sensor filter time constant \[s\].
+const BARO_TAU_S: f32 = 1.0;
 /// Open-circuit IAT reading: the ECU's pull-up drives the input to the cold rail, below
 /// the sensor's −40 °C operating range so it cannot be confused with arctic air.
 const IAT_OPEN_READING_C: f32 = -50.0;
@@ -40,6 +42,8 @@ pub struct SensorReadings {
     pub rpm: f32,
     /// Manifold absolute pressure \[kPa\].
     pub map_kpa: f32,
+    /// Ambient (barometric) pressure from the sensor in the ECU housing \[kPa\].
+    pub baro_kpa: f32,
     /// Intake air temperature \[°C\].
     pub iat_c: f32,
     /// Engine coolant temperature \[°C\].
@@ -93,6 +97,7 @@ impl SensorReadings {
         Self {
             rpm: 0.0,
             map_kpa: baro_kpa,
+            baro_kpa,
             iat_c: amb_c,
             ect_c: amb_c,
             oil_temp_c: amb_c,
@@ -171,8 +176,15 @@ impl SensorState {
 
         let map_true = plant.air.p_man + faults.map_bias_pa;
         let map_noisy = map_true * 1.0e-3 + 0.15 * rng.normal();
-        // 3-bar sensor transfer function saturates at its rails.
-        r.map_kpa = clampf(approach(r.map_kpa, map_noisy, dt, MAP_TAU_S), 10.0, 300.0);
+        // 3-bar sensor transfer function saturates at its output rails (≈ 0.04 V / 4.9 V).
+        r.map_kpa = clampf(approach(r.map_kpa, map_noisy, dt, MAP_TAU_S), 2.0, 300.0);
+        // Ambient-pressure sensor on the ECU board: slow, quiet.
+        r.baro_kpa = approach(
+            r.baro_kpa,
+            ctl.ambient.pressure_pa * 1.0e-3 + 0.03 * rng.normal(),
+            dt,
+            BARO_TAU_S,
+        );
 
         r.iat_c = if faults.iat_open_circuit {
             IAT_OPEN_READING_C

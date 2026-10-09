@@ -254,12 +254,11 @@ impl EngineSim {
 
         let omega = self.plant.crank.omega;
         // Delays from the cycle computation (start of compression, BDC) to firing TDC and
-        // to exhaust valve opening, for audio scheduling, at the cycle-mean crank speed (the
-        // instantaneous speed at BDC sits in a firing-ripple trough).
-        let omega_ev = self.plant.omega_cycle_mean.max(1.0);
-        let time_to_tdc = core::f32::consts::PI / omega_ev;
+        // to exhaust valve opening, for audio scheduling, from the ripple-free speed and
+        // its trend (the instantaneous speed at BDC sits in a firing-ripple trough).
+        let time_to_tdc = self.plant.time_to_turn(core::f32::consts::PI);
         let evo_atdc = (180.0 - self.spec.valves.evo_bbdc_deg).to_radians();
-        let time_to_evo = (core::f32::consts::PI + evo_atdc) / omega_ev;
+        let time_to_evo = self.plant.time_to_turn(core::f32::consts::PI + evo_atdc);
         for c in 0..n {
             if !self.plant.fired[c] {
                 continue;
@@ -391,12 +390,12 @@ impl EngineSim {
             Warning::HighOilTemp,
             p.thermal.t_oil > ZERO_CELSIUS_K + 135.0,
         );
-        // Not during commanded fuel cuts, whose film-only cycles are lean by design, nor
-        // while their lean gas is still being flushed through the exhaust.
+        // Not during commanded fuel cuts, whose film-only cycles are lean by design, nor for
+        // the couple of engine cycles their gas still dominates the exhaust λ.
         let fuel_cut = self.ecu.rev_cut
             || self.ecu.dfco
             || self.ecu.overboost_cut
-            || self.ecu.post_cut_hold > 0.0;
+            || self.ecu.cut_flush_hold > 0.0;
         w.set(
             Warning::LeanUnderLoad,
             running
