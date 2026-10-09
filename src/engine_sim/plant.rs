@@ -23,6 +23,15 @@ use super::thermo::{
 
 /// Longest firing interval still timed for event prediction (≈ 37 rpm on a four) \[s\].
 const MAX_FIRING_INTERVAL_S: f32 = 0.8;
+/// Shortest firing interval accepted as a real one (≈ 75 000 rpm on a four) \[s\]: a
+/// shorter one is the same event crossed twice through rounding of the crank angle.
+const MIN_FIRING_INTERVAL_S: f32 = 1.0e-4;
+/// Typical starter cranking speed (≈ 150 rpm), the floor of event-delay predictions
+/// \[rad/s\].
+const CRANKING_SPEED_RAD_S: f32 = 150.0 * RPM_TO_RAD_S;
+/// Time constant of the rock-back of a stopped crank pushed backwards by its trapped
+/// charge (a fraction of a revolution against the rotating inertia) \[s\].
+const ROCK_BACK_TAU_S: f32 = 0.1;
 /// Normalisation of the per-stroke torque shape `g(x) = sin x · (1 − x/π)³` on [0, π]:
 /// ∫₀^π g dx = (π² − 6)/π² ≈ 0.392. The shape peaks ≈ 40° from TDC, like the measured
 /// gas-torque of a firing cylinder, and its integral equals the stroke work, so the mean
@@ -151,6 +160,9 @@ pub(crate) struct Plant {
     pub t_fresh: f32,
     pub valve_float: f32,
     pub exhaust_lambda: f32,
+    /// Exhaust λ mixed over injected cycles only: the mixture the engine burns, without the
+    /// air of commanded fuel cuts.
+    pub exhaust_lambda_fuelled: f32,
     pub exhaust_lambda_apparent: f32,
     pub exhaust_port_temp: f32,
     pub exhaust_mass_flow: f32,
@@ -254,6 +266,7 @@ impl Plant {
             t_fresh: t,
             valve_float: 0.0,
             exhaust_lambda: 1.0,
+            exhaust_lambda_fuelled: 1.0,
             exhaust_lambda_apparent: 3.0,
             exhaust_port_temp: t,
             exhaust_mass_flow: 0.0,
@@ -265,7 +278,8 @@ impl Plant {
             fire_fraction: [0.0; MAX_CYLINDERS],
             firing_intervals_s: [0.0; 2],
             intervals_valid: 0,
-            since_event_s: 0.0,
+            // No event yet: the first one opens timing, it does not close an interval.
+            since_event_s: 2.0 * MAX_FIRING_INTERVAL_S,
             catalyst_efficiency: 0.0,
             hc_store_j: 0.0,
             o2_store_kg: 0.0,
@@ -300,6 +314,7 @@ impl Plant {
             ..CrankState::default()
         };
         self.intervals_valid = 0;
+        self.since_event_s = 2.0 * MAX_FIRING_INTERVAL_S;
     }
 
     /// Puts all thermal masses at fully-warm operating temperature.
@@ -341,6 +356,10 @@ impl Plant {
     fn record_firing_interval(&mut self, duration_s: f32) {
         if duration_s > MAX_FIRING_INTERVAL_S {
             self.intervals_valid = 0;
+        } else if duration_s < MIN_FIRING_INTERVAL_S
+            || (self.intervals_valid > 0 && duration_s < 0.25 * self.firing_intervals_s[0])
+        {
+            // The same event crossed twice, not a firing interval: keep the history.
         } else {
             self.firing_intervals_s = [duration_s, self.firing_intervals_s[0]];
             self.intervals_valid = (self.intervals_valid + 1).min(2);
@@ -352,15 +371,21 @@ impl Plant {
     ///
     /// Uses the durations of the last two firing intervals, as production ECUs time crank
     /// segments: the mean speed over a whole interval, ω̄ = (4π/n)/T, carries no
-    /// firing-pulse ripple because the ripple is periodic in the interval, so at steady
-    /// speed the prediction is exact. The two interval means, centred half an interval
-    /// back, give the acceleration α = (ω̄₁ − ω̄₀)/((T₁ + T₀)/2) and the speed at the event
-    /// ω = ω̄₁ + α·T₁/2; the angle then follows φ = ω·t + ½·α·t², solved in the
-    /// cancellation-free form t = 2φ/(ω + √(ω² + 2αφ)). A deceleration that would stop the
-    /// crank short of `angle`, or fewer than two timed intervals (start, very slow
-    /// cranking), falls back to the current speed.
+    /// firing-pulse ripple because the ripple is periodic in the interval. At steady speed
+    /// the prediction is therefore exact for angles that are whole multiples of the firing
+    /// interval (TDC on fours and eights); other angles (EVO, TDC with 1–3 or 5–7
+    /// cylinders) keep the ripple's phase error, a few crank degrees at low speed. The two
+    /// interval means, centred half an interval back, give the acceleration
+    /// α = (ω̄₁ − ω̄₀)/((T₁ + T₀)/2) and the speed at the event ω = ω̄₁ + α·T₁/2; the angle
+    /// then follows φ = ω·t + ½·α·t², solved in the cancellation-free form
+    /// t = 2φ/(ω + √(ω² + 2αφ)). A deceleration that stops the crank short of `angle` (the
+    /// event will not come) reports the predicted stop time −ω/α, capped at the delay at
+    /// the current speed; fewer than two timed intervals (start, very slow cranking) fall
+    /// back to the current speed, floored at cranking speed.
     pub(crate) fn time_to_turn(&self, angle: f32) -> f32 {
-        let omega_now = self.crank.omega.max(1.0);
+        // Below cranking speed the crank is either being spun up by the starter or about to
+        // stop; either way it will not take longer than at cranking speed.
+        let omega_now = self.crank.omega.max(CRANKING_SPEED_RAD_S);
         if self.intervals_valid < 2 {
             return angle / omega_now;
         }
@@ -368,13 +393,26 @@ impl Plant {
         let [t1, t0] = self.firing_intervals_s;
         let (w1, w0) = (interval_angle / t1, interval_angle / t0);
         let alpha = (w1 - w0) / (0.5 * (t1 + t0));
-        let omega = (w1 + alpha * 0.5 * t1).max(1.0);
+        let omega = w1 + alpha * 0.5 * t1;
         let disc = omega * omega + 2.0 * alpha * angle;
-        if disc > 0.0 {
+        if omega > 0.0 && disc > 0.0 {
             2.0 * angle / (omega + disc.sqrt())
         } else {
-            angle / omega
+            // Only a deceleration (α < 0) gets here.
+            let stop = omega.max(0.0) / -alpha.min(-1.0e-6);
+            stop.min(angle / omega_now)
         }
+    }
+
+    /// Lets the charge trapped in a stopped engine leak away (an overnight soak): the
+    /// stored compression and expansion works no longer act on the crank.
+    pub(crate) fn release_trapped_charge(&mut self) {
+        let n = self.cylinders;
+        for cyl in &mut self.cyl[..n] {
+            cyl.work_compression_j = 0.0;
+            cyl.work_expansion_j = 0.0;
+        }
+        self.torque.gas_instant = 0.0;
     }
 
     /// Advances the plant by one step.
@@ -492,7 +530,7 @@ impl Plant {
         };
 
         let theta_before = self.crank.theta;
-        dynamics::step(
+        let crank_pushed_back = dynamics::step(
             &mut self.crank,
             &CrankInputs {
                 gas_torque: gas,
@@ -512,9 +550,20 @@ impl Plant {
             // A stopped crank has no combustion: the last cycle's expansion work must not
             // keep acting as a phantom forward torque on it. The trapped charge still acts
             // as a lossless air spring (W_exp = −W_comp, an odd torque about TDC with zero
-            // net work), which is what holds a car parked in gear.
+            // net work), which is what holds a car parked in gear. When that spring pushes
+            // the crank backwards harder than static friction holds it, a real crank rocks
+            // back towards the balance point between the compressing and the expanding
+            // cylinder; the forward-only crank model releases the charge instead, until
+            // friction can hold what is left.
+            let release = if crank_pushed_back {
+                lag_alpha(dt, ROCK_BACK_TAU_S)
+            } else {
+                0.0
+            };
             for cyl in &mut self.cyl[..n] {
                 cyl.work_expansion_j = cyl.work_expansion_j.min(-cyl.work_compression_j);
+                cyl.work_compression_j = flush_tiny(cyl.work_compression_j * (1.0 - release));
+                cyl.work_expansion_j = flush_tiny(cyl.work_expansion_j * (1.0 - release));
             }
         }
 
@@ -674,13 +723,16 @@ impl Plant {
         self.fuel_accum = 0.0;
 
         let m = lag_alpha(dt, MEAN_FILTER_TAU);
+        // Cycle means describe a turning engine: a stopped crank does no indicated work,
+        // whatever static torque its trapped charge exerts (still shown instantaneously).
+        let gas_cycle = if self.crank.omega > 0.0 { gas } else { 0.0 };
         let tq = &mut self.torque;
         tq.gas_instant = gas;
-        tq.indicated_mean += (gas - tq.indicated_mean) * m;
+        tq.indicated_mean += (gas_cycle - tq.indicated_mean) * m;
         tq.friction += (friction - tq.friction) * m;
         tq.pumping += (pumping - tq.pumping) * m;
         tq.accessory += (accessory - tq.accessory) * m;
-        tq.brake_mean += (gas + pumping - friction - accessory - tq.brake_mean) * m;
+        tq.brake_mean += (gas_cycle + pumping - friction - accessory - tq.brake_mean) * m;
 
         self.sanitize(&amb);
     }
@@ -712,6 +764,7 @@ impl Plant {
         self.exhaust_enthalpy_flow = finite_or(self.exhaust_enthalpy_flow, 0.0);
         self.fuel_mass_flow = finite_or(self.fuel_mass_flow, 0.0);
         self.exhaust_lambda = finite_or(self.exhaust_lambda, 1.0);
+        self.exhaust_lambda_fuelled = finite_or(self.exhaust_lambda_fuelled, 1.0);
         self.exhaust_lambda_apparent = finite_or(self.exhaust_lambda_apparent, 1.0);
         self.oil_pressure_pa = finite_or(self.oil_pressure_pa, 0.0);
         self.fuel_rail_pa = finite_or(self.fuel_rail_pa, 0.0);
@@ -897,6 +950,9 @@ impl Plant {
         let n = self.cylinders as f32;
         let lam = r.lambda.min(3.0);
         self.exhaust_lambda += (lam - self.exhaust_lambda) / n;
+        if m_inj > 0.0 {
+            self.exhaust_lambda_fuelled += (lam - self.exhaust_lambda_fuelled) / n;
+        }
         // The wide-band sensor's catalytic electrode oxidises exhaust hydrocarbons, so it
         // sees the λ of *all* fuel delivered, including the unvaporised fraction.
         let lam_total = if fuel_delivered > 1.0e-12 {

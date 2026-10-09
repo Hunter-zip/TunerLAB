@@ -110,8 +110,10 @@ pub(crate) struct CrankInputs {
     pub seized: bool,
 }
 
-/// Advances crank and load by one step.
-pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt: f32) {
+/// Advances crank and load by one step. Returns `true` when the crank is at rest and the
+/// net torque on it exceeds static friction backwards: the crank would rock back, which
+/// this one-directional model represents by releasing what pushes it (see the plant).
+pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt: f32) -> bool {
     let omega = st.omega;
     if !matches!(load, LoadModel::Dyno(_)) {
         st.dyno_engaged = false;
@@ -267,6 +269,7 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
         st.driveline_spring_nm = approach(spring, 0.0, dt, DRIVELINE_RELAX_TAU_S);
     }
     st.theta = wrap_cycle(st.theta + st.omega * dt);
+    pushed_back
 }
 
 #[cfg(test)]

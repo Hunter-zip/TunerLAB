@@ -390,8 +390,9 @@ impl EngineSim {
             Warning::HighOilTemp,
             p.thermal.t_oil > ZERO_CELSIUS_K + 135.0,
         );
-        // Not during commanded fuel cuts, whose film-only cycles are lean by design, nor for
-        // the couple of engine cycles their gas still dominates the exhaust λ.
+        // The mixture warnings judge the λ the engine burns (fuelled cycles only), and stay
+        // quiet during commanded fuel cuts, whose film-only cycles are lean by design, and
+        // for the few cycles after one while the port wall film rebuilds.
         let fuel_cut = self.ecu.rev_cut
             || self.ecu.dfco
             || self.ecu.overboost_cut
@@ -400,11 +401,14 @@ impl EngineSim {
             Warning::LeanUnderLoad,
             running
                 && !fuel_cut
-                && p.exhaust_lambda > 1.05
+                && p.exhaust_lambda_fuelled > 1.05
                 && p.air.p_man > 0.8 * self.controls.ambient.pressure_pa
                 && rpm > 1500.0,
         );
-        w.set(Warning::RichMixture, running && p.exhaust_lambda < 0.7);
+        w.set(
+            Warning::RichMixture,
+            running && p.exhaust_lambda_fuelled < 0.7,
+        );
         // Turbine wheels set the EGT ceiling on turbo engines, exhaust valves and the
         // catalyst on naturally aspirated ones.
         let egt_limit = match &self.spec.turbo {
@@ -689,6 +693,7 @@ impl EngineSim {
         self.plant.air.t_exh = t;
         self.plant.air.t_post_turbine = t;
         self.plant.exhaust_port_temp = t;
+        self.plant.release_trapped_charge();
         self.sensors.settle(&self.plant, &self.faults);
         self.sensors.readings.egt_c = t - ZERO_CELSIUS_K;
         self.update_warnings();

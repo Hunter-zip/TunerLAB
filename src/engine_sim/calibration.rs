@@ -21,6 +21,14 @@ pub const PEDAL_POINTS: usize = 8;
 /// Number of breakpoints of the coolant-temperature curves.
 pub const COOLANT_POINTS: usize = 8;
 
+/// Cranking pulse widths of the reference engine versus coolant temperature \[ms\].
+const CRANKING_REF_PULSE_MS: [f32; COOLANT_POINTS] =
+    [26.0, 21.0, 19.0, 16.0, 14.0, 13.0, 12.0, 11.5];
+/// Cylinder displacement of the reference engine \[m³\].
+const CRANKING_REF_CYLINDER_M3: f32 = 0.5e-3;
+/// Injector static flow of the reference engine \[g/s\].
+const CRANKING_REF_INJECTOR_G_S: f32 = 3.2;
+
 /// Errors from [`Calibration::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationError {
@@ -552,6 +560,19 @@ impl Calibration {
                 * 1000.0;
         }
 
+        // Cranking fuel, characterised as pulse widths on the reference 2.0 L engine
+        // (0.5 L cylinders, 3.2 g/s injectors) and rescaled as fuel mass to this engine's
+        // cylinder size and injector flow, the dead time at the cranking battery voltage
+        // (10 V) kept: t = t_dead + (t_ref − t_dead)·(V_cyl/V_ref)·(q_ref/q).
+        let crank_scale = (v_cyl / CRANKING_REF_CYLINDER_M3)
+            * (CRANKING_REF_INJECTOR_G_S / injector_flow_g_s.max(1.0e-3));
+        let dead_cranking_ms = dead_values[1];
+        let mut cranking_values = [0.0; COOLANT_POINTS];
+        for (v, &t_ref) in cranking_values.iter_mut().zip(CRANKING_REF_PULSE_MS.iter()) {
+            let pulse = dead_cranking_ms + (t_ref - dead_cranking_ms).max(0.0) * crank_scale;
+            *v = round_to(pulse, 0.1).clamp(0.0, 100.0);
+        }
+
         // Transient-fuel calibration measured at 60 kPa on the engine.
         let mut x_values = [0.0; COOLANT_POINTS];
         let mut tau_values = [0.0; COOLANT_POINTS];
@@ -604,10 +625,7 @@ impl Calibration {
                 COOLANT_AXIS,
                 [1.45, 1.32, 1.25, 1.15, 1.08, 1.03, 1.0, 1.0],
             ),
-            cranking_pulse_ms: Table1D::new(
-                COOLANT_AXIS,
-                [26.0, 21.0, 19.0, 16.0, 14.0, 13.0, 12.0, 11.5],
-            ),
+            cranking_pulse_ms: Table1D::new(COOLANT_AXIS, cranking_values),
             cranking_decay_s: 3.0,
             cranking_spark_deg: 8.0,
             after_start_enrichment: Table1D::new(

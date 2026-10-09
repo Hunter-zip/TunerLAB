@@ -20,7 +20,7 @@ Ultimately, TunerLAB aims to recreate the structural behavior, datalogs, and use
 ## 🛠️ Tech Stack & Key Features
 
 - **Core Engine:** Written in pure, modern **Rust** with an allocation-free, lock-free simulation loop (verified by a counting-allocator test), ready to be driven from a real-time audio thread.
-- **Physics Simulation:** Crank-angle-resolved combustion, compressible air path, turbocharging, knock, thermal and damage models running at 4 kHz, 130–180× faster than real time.
+- **Physics Simulation:** Crank-angle-resolved combustion, compressible air path, turbocharging, knock, thermal and damage models running at 4 kHz, ≈ 100–150× faster than real time on one core (≈ 2 µs per 0.25 ms step).
 - **Cross-Platform & Lightweight:** Windows 10/11 and Linux, OpenGL/Vulkan rendering via `egui` (Phase 3).
 - **Localization (i18n):** **English (EN)** and **Polish (PL)** for every status, warning, trouble code, failure and fault from day one.
 - **Business Model (Freemium):** Entry-level concepts and naturally aspirated tuning are free. Advanced modules (forced induction, launch control, full calibration workflows) are unlocked via a premium course tier.

@@ -169,8 +169,14 @@ impl ThermalModel {
         let q_mc = ua_mc * (st.t_metal - st.t_coolant);
         let q_mo = s.metal_oil_ua * (1.0 + rpm / 3000.0) * (st.t_metal - st.t_oil);
         // Oil/coolant plate exchanger: both pumps are engine driven, so its conductance
-        // follows the same forced-convection flow factor as the coolant jacket.
-        let q_oc = s.oil_cooler_ua * flow_factor * level.max(0.05) * (st.t_oil - st.t_coolant);
+        // follows the same forced-convection flow factor as the coolant jacket. The pair is
+        // relaxed exactly over the step, ΔT ← ΔT·e^(−x) with x = UA·dt·(1/C_oil + 1/C_cool),
+        // stable for any conductance; the heat moved, E = ΔT·(1 − e^(−x))/(1/C_oil +
+        // 1/C_cool), tends to UA·ΔT·dt for small x.
+        let coolant_heat_capacity = s.coolant_capacity * level.max(0.05);
+        let ua_oc = s.oil_cooler_ua * flow_factor * level.max(0.05);
+        let inv_c_oc = 1.0 / s.oil_capacity + 1.0 / coolant_heat_capacity;
+        let e_oc = (st.t_oil - st.t_coolant) * (1.0 - (-ua_oc * dt * inv_c_oc).exp()) / inv_c_oc;
 
         // Thermostat: wax element opening between start and full temperatures.
         let thermostat_target = match inp.thermostat_fault {
@@ -222,9 +228,9 @@ impl ThermalModel {
         st.t_metal += (inp.wall_heat_j.max(0.0) + (1.0 - FRICTION_TO_OIL) * e_f
             - (q_mc + q_mo + q_ma) * dt)
             / s.metal_capacity;
-        st.t_coolant += (q_mc + q_oc - q_rad) * dt / (s.coolant_capacity * level.max(0.05));
+        st.t_coolant += ((q_mc - q_rad) * dt + e_oc) / coolant_heat_capacity;
         st.t_oil +=
-            (FRICTION_TO_OIL * e_f + piston_to_oil_j + (q_mo - q_oa - q_oc) * dt) / s.oil_capacity;
+            (FRICTION_TO_OIL * e_f + piston_to_oil_j + (q_mo - q_oa) * dt - e_oc) / s.oil_capacity;
 
         // Coolant inventory: boil-over through the expansion tank and damage leaks.
         let mut loss = inp.coolant_leak_per_s.max(0.0);

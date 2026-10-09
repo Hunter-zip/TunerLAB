@@ -63,20 +63,34 @@ const RPM_RATE_TAU_S: f32 = 0.05;
 const MAP_STANDSTILL_SETTLE_S: f32 = 2.0;
 /// Largest MAP–BARO difference a healthy sensor shows at standstill \[kPa\].
 const MAP_STANDSTILL_TOLERANCE_KPA: f32 = 8.0;
+/// Time constant of the slow MAP and BARO copies that tell a settled pressure from one
+/// still moving (a manifold held up by a spinning-down turbo, a filtered BARO catching up
+/// with an ambient change) \[s\].
+const PRESSURE_SETTLE_TAU_S: f32 = 1.0;
+/// A reading within this of its slow copy has settled: |dp/dt| ≲ 0.5 kPa/s \[kPa\].
+const PRESSURE_SETTLED_KPA: f32 = 0.5;
 /// Overboost fuel cut, once triggered, stays latched until the pedal falls below this \[%\].
 const OVERBOOST_RELEASE_PEDAL_PCT: f32 = 20.0;
 /// MAP reading at or below which the sensor circuit is judged shorted low (P0107) \[kPa\].
-/// The manifold of a running engine never falls below ≈ 6 kPa, even on closed-throttle
-/// overrun, so only a circuit fault or a large negative offset drives the reading onto
-/// the 2 kPa output rail.
-const MAP_LOW_LIMIT_KPA: f32 = 3.0;
+/// On closed-throttle overrun the manifold bottoms out at ≈ 7 % of ambient (≈ 7 kPa at sea
+/// level, ≈ 3.5 kPa at the 50 kPa altitude limit), so only a circuit fault, or an offset
+/// large enough to push overrun readings onto the 2 kPa output rail, holds the reading
+/// here for the 1 s debounce.
+const MAP_LOW_LIMIT_KPA: f32 = 2.5;
 /// Upper bound of the in-gear anti-stall idle-air term \[duty\].
 const IDLE_GEAR_LIMIT: f32 = 0.3;
-/// Bleed-off time constant of the in-gear anti-stall term once speed is back \[s\].
+/// Bleed-off time constant of the in-gear idle-air terms once speed is back, or once the
+/// clutch or neutral switch hands idle back to the neutral-learned integrator \[s\].
 const IDLE_GEAR_BLEED_TAU_S: f32 = 1.0;
-/// Engine cycles after a fuel cut during which the cut gas still dominates the exhaust λ
-/// that the instructor warnings read.
-const CUT_FLUSH_CYCLES: f32 = 2.0;
+/// Largest closing trim of the in-gear idle term while creeping \[duty\].
+const IDLE_GEAR_TRIM_DOWN: f32 = 0.05;
+/// Vehicle speed below which in-gear idle may close the valve: creeping, with the engine
+/// driving the car, not coasting, where the wheels hold the engine speed \[km/h\].
+const IDLE_GEAR_CREEP_KPH: f32 = 15.0;
+/// Engine cycles after a fuel cut during which the instructor's mixture warnings stay
+/// quiet: they read the λ of fuelled cycles only, and the first few of those after a cut
+/// run lean by design while the intake-port wall film rebuilds.
+const CUT_FLUSH_CYCLES: f32 = 3.0;
 /// IAT reading below which the circuit is judged open (the pull-up drives the input to
 /// the cold rail at −50 °C, outside the −40 °C operating range) \[°C\].
 const IAT_OPEN_LIMIT_C: f32 = -45.0;
@@ -174,6 +188,9 @@ pub(crate) struct Ecu {
     stopped_time: f32,
     /// In-gear anti-stall idle air \[duty\]: only opens, discarded when the driveline opens.
     idle_int_gear: f32,
+    /// Slow copies of the MAP and BARO readings (see [`PRESSURE_SETTLE_TAU_S`]) \[kPa\].
+    map_slow_kpa: f32,
+    baro_slow_kpa: f32,
     /// Remaining time during which the exhaust still carries fuel-cut gas \[s\].
     pub cut_flush_hold: f32,
     /// Idle-valve position the stepper is parked at when the key goes off.
@@ -242,6 +259,8 @@ impl Default for Ecu {
             // A freshly built engine has been standing for a long time.
             stopped_time: MAP_STANDSTILL_SETTLE_S,
             idle_int_gear: 0.0,
+            map_slow_kpa: 101.325,
+            baro_slow_kpa: 101.325,
             cut_flush_hold: 0.0,
             parked_idle_valve: 0.0,
             air_since_start_kg: 0.0,
@@ -437,9 +456,20 @@ impl Ecu {
         self.key_on_time += dt;
         let rpm = s.rpm;
         self.track_standstill(rpm, dt);
-        // With the engine at rest and the manifold refilled, MAP must agree with the ECU's
-        // own ambient-pressure sensor (MAP rationality at standstill).
+        if self.mode == EcuMode::Off {
+            self.map_slow_kpa = s.map_kpa;
+            self.baro_slow_kpa = s.baro_kpa;
+        }
+        self.map_slow_kpa = approach(self.map_slow_kpa, s.map_kpa, dt, PRESSURE_SETTLE_TAU_S);
+        self.baro_slow_kpa = approach(self.baro_slow_kpa, s.baro_kpa, dt, PRESSURE_SETTLE_TAU_S);
+        let pressures_settled = (s.map_kpa - self.map_slow_kpa).abs() < PRESSURE_SETTLED_KPA
+            && (s.baro_kpa - self.baro_slow_kpa).abs() < PRESSURE_SETTLED_KPA;
+        // With the engine at rest and the manifold settled at its refilled pressure, MAP
+        // must agree with the ECU's own ambient-pressure sensor (MAP rationality at
+        // standstill). A reading on the output rail is a circuit fault (P0107) instead.
         let standstill_map_mismatch = self.stopped_time > MAP_STANDSTILL_SETTLE_S
+            && pressures_settled
+            && s.map_kpa > MAP_LOW_LIMIT_KPA
             && (s.map_kpa - s.baro_kpa).abs() > MAP_STANDSTILL_TOLERANCE_KPA;
         // Engine acceleration estimate [rpm/s].
         if self.rpm_prev > 0.0 {
@@ -552,6 +582,14 @@ impl Ecu {
                 cmd.idle_valve = clampf(base_idle_valve + CRANKING_IDLE_AIR, 0.0, 1.0);
                 self.clear_running_outputs();
                 self.monitor(DtcCode::P0106, standstill_map_mismatch, 2.0, dt, now, log);
+                self.monitor(
+                    DtcCode::P0107,
+                    s.map_kpa <= MAP_LOW_LIMIT_KPA,
+                    1.0,
+                    dt,
+                    now,
+                    log,
+                );
                 return cmd;
             }
             EcuMode::Cranking => {
@@ -723,22 +761,26 @@ impl Ecu {
             self.dashpot = approach(self.dashpot, 0.0, dt, DASHPOT_TAU_S);
         }
         let idle_err = idle_target - rpm;
-        // In gear with the clutch up the wheels, not the idle valve, hold the engine speed.
-        // The neutral-learned integrator is frozen there; a separate anti-stall term may
-        // only open the valve when the engine is lugged below target, bleeds off once the
-        // speed recovers, and is discarded the moment the clutch or neutral switch opens,
-        // so declutching always lands on the neutral idle air.
-        if driveline_engaged && self.idle_active {
-            if idle_err > 0.0 {
-                self.idle_int_gear =
-                    (self.idle_int_gear + ic.ki * idle_err * dt).min(IDLE_GEAR_LIMIT);
-            } else {
-                self.idle_int_gear = approach(self.idle_int_gear, 0.0, dt, IDLE_GEAR_BLEED_TAU_S);
-            }
-        } else if driveline_engaged {
-            self.idle_int_gear = approach(self.idle_int_gear, 0.0, dt, IDLE_GEAR_BLEED_TAU_S);
+        // In gear with the clutch up the wheels, not the idle valve, may hold the engine
+        // speed. The neutral-learned integrator is frozen there, and a separate in-gear term
+        // takes over: it may open the valve (anti-stall) when the engine is lugged below
+        // target, close it by a small bounded trim only while creeping (the engine drives
+        // the car, so the valve sets the speed), and otherwise bleeds off — also after the
+        // clutch or neutral switch opens, so declutching hands idle back to the neutral
+        // integrator smoothly instead of in one step.
+        let creeping = s.vehicle_speed_kph < IDLE_GEAR_CREEP_KPH;
+        if driveline_engaged && self.idle_active && idle_err > 0.0 {
+            self.idle_int_gear = (self.idle_int_gear + ic.ki * idle_err * dt).min(IDLE_GEAR_LIMIT);
+        } else if driveline_engaged
+            && self.idle_active
+            && creeping
+            && idle_err > -IDLE_INTEGRATION_BAND_RPM
+            && self.idle_int_gear <= 0.0
+        {
+            self.idle_int_gear =
+                (self.idle_int_gear + ic.ki * idle_err * dt).max(-IDLE_GEAR_TRIM_DOWN);
         } else {
-            self.idle_int_gear = 0.0;
+            self.idle_int_gear = approach(self.idle_int_gear, 0.0, dt, IDLE_GEAR_BLEED_TAU_S);
         }
         let mut idle_valve = base_idle_valve + self.idle_int + self.idle_int_gear + self.dashpot;
         if self.idle_active {

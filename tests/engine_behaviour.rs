@@ -802,29 +802,49 @@ fn map_sensor_faults_set_their_own_codes() {
     dyno(&mut sim, 2000.0, 1.0);
     run(&mut sim, 10.0);
     assert!(sim.dtcs().contains(DtcCode::P0106));
-    // A sensor stuck at the low rail is a circuit fault, not a range/performance one.
+    // A sensor stuck at the low rail is a circuit fault, not a range/performance one,
+    // whether it fails while running or before the key is turned.
     let mut sim = warm_na(51);
     sim.inject_fault(Fault::MapSensorBias { kpa: -100.0 })
         .unwrap();
     dyno(&mut sim, 2500.0, 0.3);
     run(&mut sim, 4.0);
     assert!(sim.dtcs().contains(DtcCode::P0107));
+    for spec in [
+        EngineSpec::naturally_aspirated_2l(),
+        EngineSpec::turbocharged_2l(),
+    ] {
+        let mut sim = EngineSim::with_base_calibration(spec, 59).unwrap();
+        sim.inject_fault(Fault::MapSensorBias { kpa: -100.0 })
+            .unwrap();
+        sim.update_controls(|c| c.ignition_on = true);
+        run(&mut sim, 6.0);
+        let codes: Vec<_> = sim.dtcs().iter().collect();
+        assert_eq!(codes, vec![DtcCode::P0107]);
+    }
 }
 
+/// A cylinder event's TDC prediction error: (rpm, error in crank degrees between the
+/// predicted firing TDC and the half revolution the crank actually turned, event time
+/// relative to the start of the recording \[s\]).
+type TdcError = (f32, f64, f64);
+
 /// Ticks at the physics step for `seconds`, applying `ctl` before every step, and returns
-/// for each cylinder event (rpm, error in crank degrees between the predicted firing TDC
-/// and the half revolution the crank actually turned).
+/// the TDC prediction error of every cylinder event in that time.
 fn tdc_prediction_errors(
     sim: &mut EngineSim,
     seconds: f32,
     mut ctl: impl FnMut(&mut EngineSim, f64),
-) -> Vec<(f32, f64)> {
+) -> Vec<TdcError> {
+    use tunerlab_core::engine_sim::events::CYLINDER_EVENT_CAPACITY;
     use tunerlab_core::engine_sim::SUBSTEP_S;
-    // Record the unwrapped crank angle at every physics step.
+    // Record the unwrapped crank angle at every physics step, and drain the event ring as
+    // it fills so no event is overwritten before it is checked.
     let mut trace: Vec<(f64, f64)> = vec![(sim.time_s(), 0.0)];
+    let mut events = Vec::new();
     let mut unwrapped = 0.0_f64;
     let mut last = f64::from(sim.telemetry().crank_angle_deg);
-    let seq0 = sim.cylinder_events().next_seq();
+    let mut next = sim.cylinder_events().next_seq();
     let t0 = sim.time_s();
     for _ in 0..(seconds / SUBSTEP_S).round() as usize {
         ctl(sim, sim.time_s() - t0);
@@ -837,6 +857,10 @@ fn tdc_prediction_errors(
         unwrapped += d;
         last = a;
         trace.push((sim.time_s(), unwrapped));
+        let ring = sim.cylinder_events();
+        assert!(ring.next_seq() - next <= CYLINDER_EVENT_CAPACITY as u64);
+        events.extend(ring.since(next).copied());
+        next = ring.next_seq();
     }
     let angle_at = |t: f64| -> Option<f64> {
         let i = trace.iter().position(|(tt, _)| *tt >= t)?;
@@ -847,19 +871,19 @@ fn tdc_prediction_errors(
         let (t1, a1) = trace[i];
         Some(a0 + (a1 - a0) * (t - t0) / (t1 - t0))
     };
-    sim.cylinder_events()
-        .since(seq0)
+    events
+        .iter()
         .filter_map(|ev| {
             let tdc = ev.time_s + f64::from(ev.time_to_tdc_s);
             let (a0, a1) = (angle_at(ev.time_s)?, angle_at(tdc)?);
-            Some((ev.rpm, a1 - a0 - 180.0))
+            Some((ev.rpm, a1 - a0 - 180.0, ev.time_s - t0))
         })
         .collect()
 }
 
-fn mean_and_worst(errors: &[(f32, f64)]) -> (f64, f64) {
-    let mean = errors.iter().map(|(_, e)| e.abs()).sum::<f64>() / errors.len() as f64;
-    let worst = errors.iter().map(|(_, e)| e.abs()).fold(0.0, f64::max);
+fn mean_and_worst(errors: &[TdcError]) -> (f64, f64) {
+    let mean = errors.iter().map(|e| e.1.abs()).sum::<f64>() / errors.len() as f64;
+    let worst = errors.iter().map(|e| e.1.abs()).fold(0.0, f64::max);
     (mean, worst)
 }
 
@@ -882,16 +906,25 @@ fn audio_event_timing_predicts_firing_tdc() {
     }
 
     // Transients, the most audible events: a WOT blip in neutral and a start flare.
-    let mut sim = warm_na(54);
-    run(&mut sim, 5.0);
-    let errors = tdc_prediction_errors(&mut sim, 1.2, |s, t| {
-        s.update_controls(|c| c.pedal = if t < 0.35 { 1.0 } else { 0.0 });
-    });
-    let (mean, worst) = mean_and_worst(&errors);
-    assert!(
-        mean < 1.0 && worst < 5.0,
-        "blip: mean {mean:.1}°, worst {worst:.1}°"
-    );
+    for seed in [50, 52, 54] {
+        let mut sim = warm_na(seed);
+        run(&mut sim, 5.0);
+        let errors = tdc_prediction_errors(&mut sim, 1.2, |s, t| {
+            s.update_controls(|c| c.pedal = if t < 0.35 { 1.0 } else { 0.0 });
+        });
+        let (mean, _) = mean_and_worst(&errors);
+        assert!(errors.len() > 128, "{} blip events", errors.len());
+        assert!(mean < 1.0, "blip mean {mean:.1}° (seed {seed})");
+        // A past-only predictor cannot foresee the throttle step itself: the first
+        // ≈ 0.15 s of the blip are allowed a larger error, the rest must be tight.
+        for &(rpm, err, t) in &errors {
+            let limit = if t < 0.15 { 60.0 } else { 2.5 };
+            assert!(
+                err.abs() < limit,
+                "blip seed {seed}: {err:.1}° at {t:.3} s, {rpm:.0} rpm"
+            );
+        }
+    }
 
     let mut sim =
         EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 55).unwrap();
@@ -908,17 +941,56 @@ fn audio_event_timing_predicts_firing_tdc() {
     assert_eq!(sim.condition(), EngineCondition::Running);
     // The first firing cycles cannot be foreseen from the cranking speed; once the flare
     // is under way the timed acceleration must carry the prediction.
-    let flare: Vec<_> = errors
-        .iter()
-        .copied()
-        .filter(|(r, _)| *r > 1000.0)
-        .collect();
+    let flare: Vec<_> = errors.iter().copied().filter(|e| e.0 > 1000.0).collect();
     let (mean, worst) = mean_and_worst(&flare);
     assert!(flare.len() > 20, "{} flare events", flare.len());
     assert!(
         mean < 2.0 && worst < 5.0,
         "flare: mean {mean:.1}°, worst {worst:.1}°"
     );
+}
+
+#[test]
+fn audio_event_timing_stays_sane_at_start_and_stop() {
+    use tunerlab_core::engine_sim::SUBSTEP_S;
+    // From a fresh simulation the crank starts exactly on a cylinder event, and at the end
+    // of a spin-down the last events never reach their TDC: neither may schedule sound
+    // seconds away.
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 3).unwrap();
+    sim.prewarm();
+    sim.update_controls(|c| {
+        c.ignition_on = true;
+        c.starter = true;
+    });
+    let mut next = sim.cylinder_events().next_seq();
+    let mut worst = 0.0_f32;
+    let check = |sim: &EngineSim, next: &mut u64, worst: &mut f32| {
+        let ring = sim.cylinder_events();
+        for ev in ring.since(*next) {
+            *worst = worst.max(ev.time_to_tdc_s).max(ev.time_to_evo_s * 0.5);
+        }
+        *next = ring.next_seq();
+    };
+    for _ in 0..(1.5 / SUBSTEP_S) as usize {
+        sim.tick(SUBSTEP_S);
+        check(&sim, &mut next, &mut worst);
+    }
+    sim.update_controls(|c| {
+        c.starter = false;
+        c.ignition_on = false;
+    });
+    let mut stopped_at = None;
+    for _ in 0..(3.0 / SUBSTEP_S) as usize {
+        sim.tick(SUBSTEP_S);
+        check(&sim, &mut next, &mut worst);
+        if stopped_at.is_none() && sim.telemetry().rpm == 0.0 {
+            stopped_at = Some(sim.time_s());
+        }
+    }
+    assert!(stopped_at.is_some(), "engine did not stop");
+    // Slowest real half revolution while cranking ≈ 0.2 s.
+    assert!(worst < 0.5, "an event predicted TDC {worst:.3} s away");
 }
 
 #[test]
@@ -1332,7 +1404,8 @@ fn lean_engine_on_the_rev_limiter_still_warns() {
 fn turbo_survives_sustained_full_load_with_its_oil_cooler() {
     let mut sim = warm_turbo(63);
     dyno(&mut sim, 5500.0, 1.0);
-    for _ in 0..(1200.0 / FRAME) as usize {
+    // The oil settles within two minutes; five cover it with margin.
+    for _ in 0..(300.0 / FRAME) as usize {
         sim.tick(FRAME);
         let t = sim.telemetry();
         assert!(
@@ -1425,4 +1498,174 @@ fn starter_stalls_against_a_braked_car_in_gear() {
     }
     assert!(revs < 0.01, "crank crept {revs} rev against the brake");
     assert!(sim.telemetry().vehicle_speed_kph < 0.01);
+}
+
+#[test]
+fn healthy_engine_does_not_warn_lean_after_fuel_cuts() {
+    // On the rev limiter, and on every tip-in after an overrun fuel cut.
+    for spec in [
+        EngineSpec::naturally_aspirated_2l(),
+        EngineSpec::turbocharged_2l(),
+    ] {
+        let mut sim = EngineSim::with_base_calibration(spec, 62).unwrap();
+        sim.prewarm();
+        start(&mut sim);
+        let cursor = sim.events().next_seq();
+        dyno(&mut sim, 9000.0, 1.0);
+        run(&mut sim, 10.0);
+        vehicle(&mut sim, 0, 0.0, 0.0);
+        run(&mut sim, 3.0);
+        shift_up_to(&mut sim, 3, VehicleParams::default());
+        for _ in 0..5 {
+            vehicle(&mut sim, 3, 1.0, 1.0);
+            run(&mut sim, 3.0);
+            vehicle(&mut sim, 3, 1.0, 0.0);
+            run(&mut sim, 2.5);
+        }
+        let lean: Vec<_> = sim
+            .events()
+            .since(cursor)
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::Warning(Warning::LeanUnderLoad)
+                        | EventKind::Warning(Warning::InjectorDutyHigh)
+                )
+            })
+            .map(|e| e.time_s)
+            .collect();
+        assert!(lean.is_empty(), "mixture warnings at {lean:?}");
+    }
+}
+
+#[test]
+fn turbo_stall_from_boost_sets_no_map_code() {
+    // The dyno stalls the engine at full boost with the key on: the still-spinning
+    // compressor holds the manifold above ambient for many seconds while it runs down.
+    let mut sim = warm_turbo(87);
+    dyno(&mut sim, 3500.0, 1.0);
+    run(&mut sim, 6.0);
+    dyno(&mut sim, 0.0, 1.0);
+    run(&mut sim, 45.0);
+    assert_ne!(sim.condition(), EngineCondition::Running);
+    let codes: Vec<_> = sim.dtcs().iter().collect();
+    assert!(codes.is_empty(), "dyno stall: {codes:?}");
+    // Key cycled while the manifold is still pressurised.
+    let mut sim = warm_turbo(88);
+    dyno(&mut sim, 3500.0, 1.0);
+    run(&mut sim, 6.0);
+    sim.update_controls(|c| c.ignition_on = false);
+    run(&mut sim, 2.5);
+    sim.update_controls(|c| c.ignition_on = true);
+    run(&mut sim, 30.0);
+    let codes: Vec<_> = sim.dtcs().iter().collect();
+    assert!(codes.is_empty(), "key cycle: {codes:?}");
+}
+
+#[test]
+fn ambient_step_with_the_key_on_sets_no_map_code() {
+    // The filtered BARO sensor lags a full-range ambient change that an open throttle
+    // passes straight to the manifold.
+    for (from, to) in [(50_000.0, 110_000.0), (110_000.0, 50_000.0)] {
+        let mut sim =
+            EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 99).unwrap();
+        sim.update_controls(|c| c.ambient.pressure_pa = from);
+        sim.reset();
+        sim.update_controls(|c| {
+            c.ignition_on = true;
+            c.pedal = 1.0;
+        });
+        run(&mut sim, 8.0);
+        sim.update_controls(|c| c.ambient.pressure_pa = to);
+        run(&mut sim, 10.0);
+        let codes: Vec<_> = sim.dtcs().iter().collect();
+        assert!(codes.is_empty(), "{from} -> {to} Pa: {codes:?}");
+    }
+}
+
+#[test]
+fn declutching_after_a_long_cold_crawl_in_gear_keeps_idling() {
+    // Cold start at −20 °C, then ten minutes rolling in third with the pedal released while
+    // the idle air schedule warms up; then neutral.
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 73).unwrap();
+    sim.update_controls(|c| c.ambient.temperature_k = 273.15 - 20.0);
+    sim.soak_to_ambient();
+    start(&mut sim);
+    run(&mut sim, 30.0);
+    let base = VehicleParams {
+        grade_rad: 0.02,
+        ..VehicleParams::default()
+    };
+    shift_up_to(&mut sim, 3, base);
+    vehicle_with(
+        &mut sim,
+        VehicleParams {
+            gear: 3,
+            clutch: 1.0,
+            ..base
+        },
+        0.0,
+    );
+    run(&mut sim, 600.0);
+    vehicle_with(
+        &mut sim,
+        VehicleParams {
+            gear: 0,
+            clutch: 0.0,
+            brake: 1.0,
+            ..base
+        },
+        0.0,
+    );
+    let mut min_rpm = f32::MAX;
+    for _ in 0..(10.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        min_rpm = min_rpm.min(sim.telemetry().rpm);
+    }
+    assert_eq!(sim.condition(), EngineCondition::Running);
+    assert!(min_rpm > 450.0, "idle dipped to {min_rpm}");
+    let codes: Vec<_> = sim.dtcs().iter().collect();
+    assert!(codes.is_empty(), "{codes:?}");
+}
+
+#[test]
+fn creeping_off_straight_after_a_start_holds_the_idle_target() {
+    // Driving off before the idle integrator has learned anything in neutral.
+    let mut sim = warm_na(101);
+    drive_away(&mut sim);
+    vehicle(&mut sim, 1, 1.0, 0.0);
+    run(&mut sim, 20.0);
+    let rpm = average(&mut sim, 10.0, |t| t.rpm);
+    assert!((750.0..870.0).contains(&rpm), "creep at {rpm} rpm");
+}
+
+#[test]
+fn stopped_engine_reports_no_indicated_torque() {
+    let mut sim = warm_na(1);
+    run(&mut sim, 3.0);
+    sim.update_controls(|c| c.ignition_on = false);
+    run(&mut sim, 30.0);
+    let t = sim.telemetry();
+    assert_eq!(t.rpm, 0.0);
+    assert!(
+        t.indicated_torque_nm.abs() < 0.5,
+        "indicated {}",
+        t.indicated_torque_nm
+    );
+    // Whatever the trapped charge still pushes, static friction holds.
+    assert!(
+        t.brake_torque_nm.abs() < 30.0,
+        "brake {}",
+        t.brake_torque_nm
+    );
+    // An overnight soak lets the trapped charge leak away.
+    sim.soak_to_ambient();
+    run(&mut sim, 1.0);
+    let t = sim.telemetry();
+    assert!(
+        t.instantaneous_torque_nm.abs() < 0.5,
+        "instantaneous {}",
+        t.instantaneous_torque_nm
+    );
 }

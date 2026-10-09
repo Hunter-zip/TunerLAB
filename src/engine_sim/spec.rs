@@ -563,8 +563,9 @@ impl EngineSpec {
         spec.intake.manifold_volume_m3 = 0.0030;
         // Larger air filter for the higher flow.
         spec.intake.filter_restriction = 50_000.0;
-        // 5.5 g/s ≈ 450 cm³/min at 3 bar.
-        spec.fuel_system.injector_flow_kg_s = 5.5e-3;
+        // 6.5 g/s ≈ 530 cm³/min at 3 bar: ≈ 80 % duty at the rich (λ ≈ 0.72) full-boost
+        // redline, the usual OEM sizing margin.
+        spec.fuel_system.injector_flow_kg_s = 6.5e-3;
         // ≈ 1.9× the 15 g/s full-boost demand.
         spec.fuel_system.pump_capacity_kg_s = 0.028;
         // Turbine extracts energy, so the post-turbine system flows more freely.
@@ -581,9 +582,10 @@ impl EngineSpec {
             head_gasket_pressure_pa: 140.0e5,
             ..spec.limits
         };
-        spec.thermal.piston_cooling_ua = 24.0; // oil-jet cooled pistons
-                                               // Plate oil/coolant exchanger on the filter housing: ≈ 5 kW at full load with the
-                                               // oil ≈ 25 K above the coolant.
+        // Oil-jet cooled pistons.
+        spec.thermal.piston_cooling_ua = 24.0;
+        // Plate oil/coolant exchanger on the filter housing: ≈ 5 kW with the oil ≈ 25 K
+        // above the coolant at 3000 rpm, ≈ 8 kW at full load at 5500 rpm.
         spec.thermal.oil_cooler_ua = 200.0;
         spec.turbo = Some(TurboSpec {
             compressor_diameter_m: 0.052,
@@ -716,7 +718,7 @@ impl EngineSpec {
         let th = &self.thermal;
         let lub = &self.lubrication;
         let lim = &self.limits;
-        let non_negative: [(&'static str, f32); 21] = [
+        let non_negative: [(&'static str, f32); 20] = [
             ("ram_gain", b.ram_gain),
             ("overlap_loss", b.overlap_loss),
             ("charge_heating", b.charge_heating),
@@ -736,7 +738,6 @@ impl EngineSpec {
             ("metal_oil_ua", th.metal_oil_ua),
             ("metal_ambient_ua", th.metal_ambient_ua),
             ("oil_ambient_ua", th.oil_ambient_ua),
-            ("oil_cooler_ua", th.oil_cooler_ua),
             ("exhaust.backpressure", self.exhaust.backpressure),
             ("valve_contact_margin_rpm", lim.valve_contact_margin_rpm),
             ("bearing_oil_per_krpm", lim.bearing_oil_per_krpm),
@@ -750,7 +751,10 @@ impl EngineSpec {
         // (name, value, min, max), inclusive. Where a generated base calibration copies or
         // derives a value, the range keeps that value inside the calibration's own limits,
         // so every valid spec gets a valid base calibration.
-        let ranged: [(&'static str, f32, f32, f32); 28] = [
+        let ranged: [(&'static str, f32, f32, f32); 29] = [
+            // A passenger-car plate oil cooler moves a few kW at tens of kelvin
+            // (≈ 0.1–0.5 kW/K); the bound leaves room for heavy-duty exchangers.
+            ("oil_cooler_ua", th.oil_cooler_ua, 0.0, 5000.0),
             // Dead time grows as battery voltage falls; ≤ 3 ms + 6 V × 1 ms/V < 10 ms.
             (
                 "injector_dead_time_slope_s_per_v",
