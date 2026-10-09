@@ -480,7 +480,9 @@ impl EngineSpec {
                 injector_dead_time_s: 0.9e-3,
                 injector_dead_time_slope_s_per_v: 0.25e-3,
                 regulator_pressure_pa: 300_000.0,
-                pump_capacity_kg_s: 0.04,
+                // ≈ 2× the 8 g/s full-load demand at regulator pressure (≈ 80 L/h), the
+                // usual OEM sizing margin for ageing, hot fuel and low battery voltage.
+                pump_capacity_kg_s: 0.016,
             },
             combustion: CombustionSpec {
                 burn_duration_deg: 66.0,
@@ -561,7 +563,8 @@ impl EngineSpec {
         spec.intake.filter_restriction = 50_000.0;
         // 5.5 g/s ≈ 450 cm³/min at 3 bar.
         spec.fuel_system.injector_flow_kg_s = 5.5e-3;
-        spec.fuel_system.pump_capacity_kg_s = 0.065;
+        // ≈ 1.9× the 15 g/s full-boost demand.
+        spec.fuel_system.pump_capacity_kg_s = 0.028;
         // Turbine extracts energy, so the post-turbine system flows more freely.
         spec.exhaust.backpressure = 1.0e6;
         spec.exhaust.manifold_volume_m3 = 0.0012;
@@ -738,14 +741,46 @@ impl EngineSpec {
                 return Err(SpecError::OutOfRange(name));
             }
         }
-        // (name, value, min, max), inclusive.
-        let ranged: [(&'static str, f32, f32, f32); 19] = [
+        // (name, value, min, max), inclusive. Where a generated base calibration copies or
+        // derives a value, the range keeps that value inside the calibration's own limits,
+        // so every valid spec gets a valid base calibration.
+        let ranged: [(&'static str, f32, f32, f32); 28] = [
+            // Dead time grows as battery voltage falls; ≤ 3 ms + 6 V × 1 ms/V < 10 ms.
             (
                 "injector_dead_time_slope_s_per_v",
                 self.fuel_system.injector_dead_time_slope_s_per_v,
-                -1.0e-3,
+                0.0,
                 1.0e-3,
             ),
+            (
+                "injector_dead_time_s",
+                self.fuel_system.injector_dead_time_s,
+                0.0,
+                3.0e-3,
+            ),
+            (
+                "injector_flow_kg_s",
+                self.fuel_system.injector_flow_kg_s,
+                1.0e-4,
+                0.1,
+            ),
+            (
+                "injector_rated_pressure_pa",
+                self.fuel_system.injector_rated_pressure_pa,
+                5.0e4,
+                1.0e7,
+            ),
+            ("stoich_afr", self.fuel.stoich_afr, 5.0, 20.0),
+            ("displacement_m3", g.displacement_m3(), 5.0e-5, 2.0e-2),
+            (
+                "rotating_inertia_kg_m2",
+                g.rotating_inertia_kg_m2,
+                0.01,
+                10.0,
+            ),
+            ("ram_gain", b.ram_gain, 0.0, 1.0),
+            ("overlap_loss", b.overlap_loss, 0.0, 1.0),
+            ("charge_heating", b.charge_heating, 0.0, 1.0),
             (
                 "in_cylinder_evaporation",
                 self.fuel.in_cylinder_evaporation,
@@ -783,12 +818,18 @@ impl EngineSpec {
             ("head_warp_k", lim.head_warp_k, 350.0, 800.0),
             ("catalyst_melt_k", lim.catalyst_melt_k, 600.0, 2500.0),
             ("valve_float_rpm", lim.valve_float_rpm, 1000.0, 30_000.0),
-            ("redline_rpm", lim.redline_rpm, 1000.0, 30_000.0),
+            // The factory limiter cuts 200 rpm above redline, within the ECU's 15 000 rpm.
+            ("redline_rpm", lim.redline_rpm, 1000.0, 14_800.0),
         ];
         for (name, v, lo, hi) in ranged {
             if !(v.is_finite() && v >= lo && v <= hi) {
                 return Err(SpecError::OutOfRange(name));
             }
+        }
+        if self.fuel_system.injector_dead_time_s < self.fuel_system.injector_dead_time_slope_s_per_v
+        {
+            // The dead time at the 15 V end of the ECU's table would be negative.
+            return Err(SpecError::OutOfRange("injector_dead_time_s"));
         }
         if self.valves.intake_valves_per_cylinder == 0 {
             return Err(SpecError::OutOfRange("intake_valves_per_cylinder"));
@@ -935,8 +976,11 @@ impl ThermalSpec {
             oil_capacity: 7_600.0,
             metal_coolant_ua: 2_500.0,
             metal_oil_ua: 150.0,
-            metal_ambient_ua: 25.0,
-            oil_ambient_ua: 30.0,
+            // Still-air convection and radiation from block and head under the bonnet
+            // (≈ 0.8 m² at ≈ 12 W/(m²·K)) and from the sump, which sits partly in the
+            // stagnant under-body air: ≈ 18 W/K together at idle.
+            metal_ambient_ua: 10.0,
+            oil_ambient_ua: 8.0,
             // 88 °C wax element, fully open at 98 °C.
             thermostat_start_k: 361.15,
             thermostat_full_k: 371.15,
@@ -949,9 +993,10 @@ impl ThermalSpec {
             piston_capacity: 320.0,
             piston_cooling_ua: 18.0,
             piston_heat_share: 0.22,
-            // Close-coupled catalyst: ≈ 1.2 kg cordierite substrate + can × 1000 J/(kg·K)
-            // (low thermal mass for fast light-off).
-            catalyst_capacity: 1_500.0,
+            // Close-coupled catalyst: the ≈ 0.6 kg thin-wall cordierite substrate × ≈ 1000
+            // J/(kg·K). The can and mat are insulated from it and barely take part in the
+            // light-off transient, which is why close-coupled bricks light off in ≈ 1 min.
+            catalyst_capacity: 600.0,
             catalyst_light_off_k: 550.0,
         }
     }

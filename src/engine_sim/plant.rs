@@ -451,6 +451,14 @@ impl Plant {
             dt,
         );
         let dtheta = self.crank.omega * dt;
+        if self.crank.omega <= 0.0 {
+            // A stopped crank has no gas-exchange cycle: the last cycle's stored work must
+            // not keep acting as a phantom torque on it.
+            for cyl in &mut self.cyl[..n] {
+                cyl.work_compression_j = 0.0;
+                cyl.work_expansion_j = 0.0;
+            }
+        }
 
         // ---- Cylinder events (start of each compression stroke) --------------------------
         if dtheta > 0.0 && !dmg.seized {

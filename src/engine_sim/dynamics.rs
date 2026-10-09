@@ -11,23 +11,29 @@
 //! dynamically decoupled, exactly as on a real test bed, so crank-speed fluctuations and
 //! misfire signatures stay representative.
 //!
-//! In a vehicle the crank drives the gearbox through the clutch disc's torsional damper
-//! springs. The driveline is modelled the same way: a compliant, damped link whose torque
-//! is limited by the clutch's friction capacity (elasto-plastic, Dahl-type friction). The
-//! spring isolates the crank's firing-frequency speed ripple from the vehicle inertia, as
-//! the damper is designed to, which is what lets an OBD misfire monitor work in gear.
+//! In a vehicle the crank drives the wheels through two compliances in series: the clutch
+//! disc's torsional damper springs (crank side) and the half-shafts plus tyres (wheel
+//! side, which appears 1/i² softer at the crank). The driveline is a damped link of that
+//! combined stiffness whose torque is limited by the clutch's friction capacity
+//! (elasto-plastic, Dahl-type friction). It reproduces the 2–4 Hz first-gear "shuffle"
+//! mode calibrators tune anti-jerk against, and it isolates the crank's firing-frequency
+//! speed ripple from the vehicle inertia, which is what lets an OBD misfire monitor work
+//! in gear.
 
 use super::controls::LoadModel;
 use super::math::{approach, clampf, wrap_cycle, RAD_S_TO_RPM, RPM_TO_RAD_S};
 use super::thermo::GRAVITY;
 
-/// Torsional stiffness of the clutch-disc damper springs plus gearbox input shaft, referred
-/// to the crank \[N·m/rad\] (≈ 10 N·m/deg, typical of passenger-car clutch dampers). With
-/// the 0.16 kg·m² crank this keeps √(k/J)·dt ≈ 0.015, far inside the stability limit.
-const DRIVELINE_STIFFNESS: f32 = 600.0;
-/// Viscous damping of the driveline link (hysteresis friction of the damper) \[N·m·s/rad\]:
-/// damping ratio ≈ 0.2 for the first-gear shuffle mode.
-const DRIVELINE_DAMPING: f32 = 4.0;
+/// Torsional stiffness of the clutch-disc damper springs plus gearbox input shaft, at the
+/// crank \[N·m/rad\] (≈ 10 N·m/deg, typical of passenger-car clutch dampers).
+const CLUTCH_DAMPER_STIFFNESS: f32 = 600.0;
+/// Torsional stiffness of both half-shafts and the tyres, at the wheels \[N·m/rad\].
+const WHEEL_SIDE_STIFFNESS: f32 = 10_000.0;
+/// Damping ratio of the driveline mode (damper hysteresis, tyre damping).
+const DRIVELINE_DAMPING_RATIO: f32 = 0.2;
+/// Relaxation time of driveline wind-up held against a stationary end \[s\]: a stalled
+/// crank rocks back, a stopped car settles, instead of storing the spring torque forever.
+const DRIVELINE_RELAX_TAU_S: f32 = 0.02;
 /// Tyre–road friction coefficient for full brake application.
 const BRAKE_MU: f32 = 0.95;
 /// Below this speed the engine is treated as stationary for static-friction purposes \[rad/s\].
@@ -53,8 +59,8 @@ pub(crate) struct CrankState {
     pub vehicle_speed: f32,
     /// Torque transmitted through the clutch \[N·m\].
     pub clutch_torque: f32,
-    /// Twist of the clutch damper springs (crank relative to gearbox input) \[rad\].
-    pub driveline_twist: f32,
+    /// Elastic torque stored in the driveline springs \[N·m\] (positive: engine drives).
+    pub driveline_spring_nm: f32,
     /// Measured load torque: dyno load cell or clutch torque \[N·m\].
     pub load_torque: f32,
     /// Absorber rotor speed \[rad/s\].
@@ -74,7 +80,7 @@ impl Default for CrankState {
             dyno_torque: 0.0,
             vehicle_speed: 0.0,
             clutch_torque: 0.0,
-            driveline_twist: 0.0,
+            driveline_spring_nm: 0.0,
             load_torque: 0.0,
             dyno_omega: 0.0,
             coupling_twist: 0.0,
@@ -114,7 +120,7 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
     let (t_crank, t_measured) = match load {
         LoadModel::Neutral => {
             st.clutch_torque = 0.0;
-            st.driveline_twist = 0.0;
+            st.driveline_spring_nm = 0.0;
             st.dyno_torque = 0.0;
             (0.0, 0.0)
         }
@@ -133,7 +139,7 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
                 d.max_torque_nm,
             );
             st.clutch_torque = 0.0;
-            st.driveline_twist = 0.0;
+            st.driveline_spring_nm = 0.0;
             let (t_coupling, t_abs) = if d.absorber_inertia_kg_m2 > 1.0e-3 {
                 // Two-mass system: T_c = k·φ + c·(ω_e − ω_a), J_a·dω_a/dt = T_c − T_abs, with
                 // T_abs = k_p·(ω_a − ω_target) + I. Both the coupling damping and the
@@ -176,22 +182,28 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
                 v.gear_ratios[gear - 1] * v.final_drive
             };
             let t_cl = if gear == 0 {
-                st.driveline_twist = 0.0;
+                st.driveline_spring_nm = 0.0;
                 0.0
             } else {
-                // Damper springs in series with the dry friction interface: the spring
-                // twists with the speed difference across it until its torque reaches the
-                // friction capacity, beyond which the clutch slips (elasto-plastic friction).
+                // Series stiffness referred to the crank: k = 1/(1/k_clutch + i²/k_wheel).
+                // The referred vehicle inertia J_v = m·r²/i² and the crank inertia set the
+                // damping for a constant damping ratio, c = 2ζ·√(k·J_red). Both the mode
+                // frequency (≤ √(k_wheel/(m·r²)) ≤ 100 rad/s for any sanitised vehicle) and
+                // c·dt/J stay far inside the explicit-integration limits.
+                let i2 = ratio * ratio;
+                let k = 1.0 / (1.0 / CLUTCH_DAMPER_STIFFNESS + i2 / WHEEL_SIDE_STIFFNESS);
+                let j_v = v.mass_kg * v.wheel_radius_m * v.wheel_radius_m / i2;
+                let j_e = inp.inertia.max(1.0e-3);
+                let c = 2.0 * DRIVELINE_DAMPING_RATIO * (k * j_e * j_v / (j_e + j_v)).sqrt();
+                // The springs wind up with the speed difference across the driveline until
+                // their torque reaches the clutch's friction capacity, beyond which the
+                // clutch slips (elasto-plastic friction).
                 let omega_trans = st.vehicle_speed * ratio / v.wheel_radius_m;
                 let slip = omega - omega_trans;
                 let capacity = (v.clutch_capacity_nm * v.clutch).max(0.0);
-                let twist_max = capacity / DRIVELINE_STIFFNESS;
-                st.driveline_twist = clampf(st.driveline_twist + slip * dt, -twist_max, twist_max);
-                clampf(
-                    DRIVELINE_STIFFNESS * st.driveline_twist + DRIVELINE_DAMPING * slip,
-                    -capacity,
-                    capacity,
-                )
+                st.driveline_spring_nm =
+                    clampf(st.driveline_spring_nm + k * slip * dt, -capacity, capacity);
+                clampf(st.driveline_spring_nm + c * slip, -capacity, capacity)
             };
             st.clutch_torque = t_cl;
             st.dyno_torque = 0.0;
@@ -237,6 +249,12 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
     }
     if st.dyno_engaged {
         st.coupling_twist += (st.omega - st.dyno_omega) * dt;
+    }
+    // Wind-up that pushes a stationary end the way it cannot move (crank backwards, car
+    // backwards) is released: the crank rocks back, the car settles on its tyres.
+    let spring = st.driveline_spring_nm;
+    if (spring > 0.0 && st.omega <= 0.0) || (spring < 0.0 && st.vehicle_speed <= 0.0) {
+        st.driveline_spring_nm = approach(spring, 0.0, dt, DRIVELINE_RELAX_TAU_S);
     }
     st.theta = wrap_cycle(st.theta + st.omega * dt);
 }
@@ -352,5 +370,87 @@ mod tests {
         }
         assert!(peak < 300.0, "clutch torque peak {peak}");
         assert!(st.vehicle_speed > 3.0, "{}", st.vehicle_speed);
+    }
+
+    #[test]
+    fn stalled_engine_in_gear_does_not_keep_driveline_wind_up() {
+        let mut st = CrankState {
+            omega: 0.0,
+            driveline_spring_nm: 200.0,
+            ..CrankState::default()
+        };
+        let load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            brake: 1.0,
+            ..VehicleParams::default()
+        });
+        let mut dead = inputs(0.0);
+        dead.friction_torque = 30.0;
+        for _ in 0..4000 {
+            step(&mut st, &dead, &load, 2.5e-4);
+        }
+        assert!(
+            st.driveline_spring_nm.abs() < 1.0,
+            "{}",
+            st.driveline_spring_nm
+        );
+        assert_eq!(st.vehicle_speed, 0.0);
+    }
+
+    #[test]
+    fn first_gear_shuffle_mode_is_a_few_hertz() {
+        // Free oscillation of the crank against the referred vehicle after a torque step.
+        let speed = 1500.0 / RAD_S_TO_RPM * 0.316 / (3.58 * 4.06);
+        let mut st = CrankState {
+            omega: 1500.0 / RAD_S_TO_RPM,
+            vehicle_speed: speed,
+            ..CrankState::default()
+        };
+        let load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            ..VehicleParams::default()
+        });
+        // Period between the first two torque peaks of the (decaying) oscillation.
+        let mut peaks = Vec::new();
+        let (mut prev2, mut prev1) = (0.0_f32, 0.0_f32);
+        for i in 0..8000 {
+            step(&mut st, &inputs(150.0), &load, 2.5e-4);
+            let x = st.clutch_torque;
+            if i > 2 && prev1 > prev2 && prev1 >= x {
+                peaks.push(i as f32 * 2.5e-4);
+            }
+            prev2 = prev1;
+            prev1 = x;
+        }
+        assert!(peaks.len() >= 2, "{peaks:?}");
+        let f = 1.0 / (peaks[1] - peaks[0]);
+        assert!((2.0..4.5).contains(&f), "shuffle {f} Hz");
+    }
+
+    #[test]
+    fn light_vehicle_with_tall_gearing_is_stable() {
+        let mut st = CrankState {
+            omega: 3000.0 / RAD_S_TO_RPM,
+            ..CrankState::default()
+        };
+        let load = LoadModel::Vehicle(VehicleParams {
+            mass_kg: 100.0,
+            wheel_radius_m: 0.1,
+            gear_ratios: [10.0; 6],
+            final_drive: 15.0,
+            gear: 1,
+            ..VehicleParams::default()
+        });
+        let mut flips = 0;
+        let mut prev = 0.0_f32;
+        for i in 0..8000 {
+            step(&mut st, &inputs(60.0), &load, 2.5e-4);
+            if i > 4000 && st.clutch_torque * prev < 0.0 {
+                flips += 1;
+            }
+            prev = st.clutch_torque;
+        }
+        assert!(flips < 10, "{flips} sign flips");
+        assert!(st.vehicle_speed > 0.5, "{}", st.vehicle_speed);
     }
 }

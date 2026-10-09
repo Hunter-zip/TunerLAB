@@ -46,9 +46,13 @@ const STEFAN_BOLTZMANN: f32 = 5.670_374e-8;
 /// Catalyst monolith gas-side conductance at 0.02 kg/s exhaust flow \[W/K\]; laminar
 /// channel flow with entrance effects scales roughly with ṁ^0.8.
 const CATALYST_UA_REF: f32 = 100.0;
-/// Still-air shell loss of the insulated, heat-shielded close-coupled converter
-/// (≈ 0.1 m² at ≈ 15 W/(m²·K) through the mat and shield) \[W/K\].
-const CATALYST_SHELL_UA: f32 = 1.5;
+/// Still-air shell loss of the insulated, heat-shielded close-coupled converter: the
+/// ≈ 6 mm intumescent mat (≈ 2.5 W/K over 0.15 m²) in series with skin convection and
+/// radiation (≈ 2 W/K) \[W/K\].
+const CATALYST_SHELL_UA: f32 = 1.0;
+/// Growth of the catalyst shell loss per m/s of air speed. The converter sits behind the
+/// engine under a heat shield, so radiator-fan and ram air reach it only weakly.
+const CATALYST_SHELL_AIR_GAIN: f32 = 0.05;
 /// Integration interval of the thermal network \[s\] (see module docs).
 pub(crate) const THERMAL_STEP_S: f32 = 0.02;
 
@@ -238,7 +242,10 @@ impl ThermalModel {
         } else {
             0.0
         };
-        let q_cat = q_gas - CATALYST_SHELL_UA * (1.0 + 0.15 * air_speed) * (st.t_catalyst - t_amb);
+        let q_cat = q_gas
+            - CATALYST_SHELL_UA
+                * (1.0 + CATALYST_SHELL_AIR_GAIN * air_speed)
+                * (st.t_catalyst - t_amb);
         st.t_catalyst += (q_cat * dt + inp.catalyst_exotherm_j.max(0.0)) / s.catalyst_capacity;
 
         // Exhaust manifold wall: heated by the gas, cooled by convection and by radiation
@@ -260,14 +267,15 @@ mod tests {
         let model = ThermalModel::new(&ThermalSpec::two_litre());
         let mut st = ThermalState::uniform(293.0);
         let dt = THERMAL_STEP_S;
-        // ≈ 6 kW of combustion heat to the walls and 1.5 kW of friction at idle.
+        // What the plant delivers at a warm 800 rpm idle: ≈ 2.3 kW of combustion and port
+        // heat to the walls, 0.7 kW of friction and 0.5 kW through the piston crowns.
         for _ in 0..(1800.0 / dt) as usize {
             let fan_on = st.t_coolant > 373.0;
             model.step(
                 &mut st,
                 &ThermalInputs {
-                    wall_heat_j: 6000.0 * dt,
-                    friction_heat_j: 1500.0 * dt,
+                    wall_heat_j: 2800.0 * dt,
+                    friction_heat_j: 700.0 * dt,
                     rpm: 800.0,
                     ambient_t: 293.0,
                     ram_air_speed: 0.0,
@@ -283,11 +291,12 @@ mod tests {
                 dt,
             );
         }
+        // The thermostat opens and regulates in its 88–98 °C band.
         assert!(
-            st.t_coolant > 355.0 && st.t_coolant < 380.0,
+            st.t_coolant > 361.0 && st.t_coolant < 373.0,
             "coolant {}",
             st.t_coolant
         );
-        assert!(st.thermostat_pos > 0.0);
+        assert!(st.thermostat_pos > 0.02, "thermostat {}", st.thermostat_pos);
     }
 }

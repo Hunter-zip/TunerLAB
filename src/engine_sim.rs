@@ -156,6 +156,8 @@ pub struct EngineSim {
     condition: EngineCondition,
     warnings: Warnings,
     knock_hold: [f32; MAX_CYLINDERS],
+    /// Last time each warning was active \[s\], for rate-limiting its log entries.
+    warning_last_active: [f64; Warning::ALL.len()],
     misfire_hold: f32,
     fired_prev: [bool; MAX_CYLINDERS],
     mbt_cache_deg: f32,
@@ -194,6 +196,7 @@ impl EngineSim {
             condition: EngineCondition::Off,
             warnings: Warnings::NONE,
             knock_hold: [0.0; MAX_CYLINDERS],
+            warning_last_active: [f64::NEG_INFINITY; Warning::ALL.len()],
             misfire_hold: 0.0,
             fired_prev: [false; MAX_CYLINDERS],
             mbt_cache_deg: 0.0,
@@ -311,7 +314,7 @@ impl EngineSim {
 
         let decay = (-dt / WARNING_HOLD_S).exp();
         for k in &mut self.knock_hold[..n] {
-            *k *= decay;
+            *k = math::flush_tiny(*k * decay);
         }
         self.misfire_hold = (self.misfire_hold - dt).max(0.0);
 
@@ -324,11 +327,21 @@ impl EngineSim {
         self.update_warnings();
     }
 
-    /// Re-evaluates the instructor warnings and logs the ones that just became active.
+    /// Re-evaluates the instructor warnings (every substep, so the result does not depend
+    /// on the frame rate) and logs each one when it becomes active after having been clear
+    /// for at least [`WARNING_HOLD_S`]. Threshold warnings on instantaneous quantities
+    /// (engine speed with its firing ripple, piston-crown temperature) chatter at firing
+    /// frequency near their limit; without the hold they would flood the fixed-size log
+    /// and push trouble-code and damage events out of it.
     fn update_warnings(&mut self) {
         let warnings = self.evaluate_warnings();
         for w in warnings.newly_set(self.warnings).iter() {
-            self.log.push(self.time_s, EventKind::Warning(w));
+            if self.time_s - self.warning_last_active[w as usize] > f64::from(WARNING_HOLD_S) {
+                self.log.push(self.time_s, EventKind::Warning(w));
+            }
+        }
+        for w in warnings.iter() {
+            self.warning_last_active[w as usize] = self.time_s;
         }
         self.warnings = warnings;
     }
@@ -701,6 +714,7 @@ impl EngineSim {
         self.condition = EngineCondition::Off;
         self.warnings = Warnings::NONE;
         self.knock_hold = [0.0; MAX_CYLINDERS];
+        self.warning_last_active = [f64::NEG_INFINITY; Warning::ALL.len()];
         self.misfire_hold = 0.0;
         self.fired_prev = [false; MAX_CYLINDERS];
         self.mbt_cache_deg = 0.0;

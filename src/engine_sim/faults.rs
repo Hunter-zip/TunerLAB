@@ -8,50 +8,52 @@ use core::fmt;
 
 use super::spec::MAX_CYLINDERS;
 
-/// A fault with its severity parameters.
+/// A fault with its severity parameters. Each severity range starts at the smallest value
+/// that leaves a diagnosable symptom; [`EngineSim::inject_fault`](super::EngineSim::inject_fault)
+/// rejects milder values.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Fault {
     /// MAP sensor reads high (positive) or low (negative) by a constant offset.
     MapSensorBias {
-        /// Offset \[kPa\].
+        /// Offset \[kPa\], magnitude 2–100.
         kpa: f32,
     },
     /// Coolant temperature sensor offset (e.g. corroded connector).
     CoolantSensorBias {
-        /// Offset \[K\]; negative reads colder than reality.
+        /// Offset \[K\], magnitude 3–80; negative reads colder than reality.
         kelvin: f32,
     },
     /// Intake air temperature sensor open circuit (reads −50 °C, below the sensor range).
     IntakeAirSensorOpen,
     /// Ageing wide-band O2 sensor with a slow response.
     OxygenSensorSlow {
-        /// Multiplier on the response time constant (> 1).
+        /// Multiplier on the response time constant, 1.5–50.
         factor: f32,
     },
     /// O2 sensor reading offset (exhaust leak upstream of the sensor reads lean).
     OxygenSensorBias {
-        /// Offset in λ.
+        /// Offset in λ, magnitude 0.02–0.5.
         lambda: f32,
     },
     /// Knock sensor disconnected: no knock feedback.
     KnockSensorDead,
     /// Unmetered air entering the intake manifold (cracked hose, PCV valve).
     VacuumLeak {
-        /// Equivalent hole diameter \[mm\].
+        /// Equivalent hole diameter \[mm\], 0.5–30.
         diameter_mm: f32,
     },
     /// Partially clogged injector.
     InjectorClogged {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Remaining flow fraction 0..1.
+        /// Remaining flow fraction, 0–0.95.
         flow_fraction: f32,
     },
     /// Ignition coil with reduced secondary output (cracked housing, shorted turns).
     IgnitionCoilWeak {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Remaining output fraction 0..1.
+        /// Remaining output fraction, 0–0.9.
         strength: f32,
     },
     /// Thermostat stuck open: engine never reaches operating temperature.
@@ -60,29 +62,29 @@ pub enum Fault {
     ThermostatStuckClosed,
     /// Stretched timing chain retarding the camshaft.
     TimingChainStretch {
-        /// Cam retard [crank deg].
+        /// Cam retard [crank deg], 2–30.
         retard_deg: f32,
     },
     /// Worn fuel pump that cannot meet high-load demand.
     FuelPumpWeak {
-        /// Remaining capacity fraction 0..1.
+        /// Remaining capacity fraction, 0.05–0.9.
         capacity_fraction: f32,
     },
     /// Clogged catalyst / crushed exhaust pipe.
     ExhaustRestriction {
-        /// Multiplier on exhaust back-pressure (> 1).
+        /// Multiplier on exhaust back-pressure, 1.5–50.
         factor: f32,
     },
     /// Low compression in one cylinder (worn rings, leaking valve).
     LowCompression {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Fraction of trapped charge lost 0..1.
+        /// Fraction of trapped charge lost, 0.05–1.
         leak_fraction: f32,
     },
     /// Leaking boost pipe or intercooler (turbo engines).
     BoostLeak {
-        /// Equivalent hole diameter \[mm\].
+        /// Equivalent hole diameter \[mm\], 2–40.
         diameter_mm: f32,
     },
     /// Wastegate seized shut (turbo engines): uncontrolled boost.
@@ -262,14 +264,19 @@ fn hole_area(d_mm: f32) -> f32 {
     PI / 4.0 * d * d
 }
 
-/// Accepts `v` within `[lo, hi]` but different from the healthy value `neutral`, which
-/// would make the fault invisible while still reporting it as active.
-fn check(v: f32, lo: f32, hi: f32, neutral: f32) -> Result<f32, FaultError> {
-    if v.is_finite() && v >= lo && v <= hi && v != neutral {
+/// Accepts `v` within `[lo, hi]`. Every fault's range starts at its smallest *detectable*
+/// severity, so an injected fault always leaves a symptom a student can find.
+fn check(v: f32, lo: f32, hi: f32) -> Result<f32, FaultError> {
+    if v.is_finite() && v >= lo && v <= hi {
         Ok(v)
     } else {
         Err(FaultError::InvalidParameter)
     }
+}
+
+/// Accepts a signed offset whose magnitude lies within `[min_abs, max_abs]`.
+fn check_offset(v: f32, min_abs: f32, max_abs: f32) -> Result<f32, FaultError> {
+    check(v.abs(), min_abs, max_abs).map(|_| v)
 }
 
 impl FaultState {
@@ -298,32 +305,32 @@ impl FaultState {
         };
         match fault {
             Fault::MapSensorBias { kpa } => {
-                self.map_bias_pa = check(kpa, -100.0, 100.0, 0.0)? * 1000.0;
+                self.map_bias_pa = check_offset(kpa, 2.0, 100.0)? * 1000.0;
             }
             Fault::CoolantSensorBias { kelvin } => {
-                self.coolant_sensor_bias_k = check(kelvin, -80.0, 80.0, 0.0)?;
+                self.coolant_sensor_bias_k = check_offset(kelvin, 3.0, 80.0)?;
             }
             Fault::IntakeAirSensorOpen => self.iat_open_circuit = true,
             Fault::OxygenSensorSlow { factor } => {
-                self.o2_lag_factor = check(factor, 1.0, 50.0, 1.0)?;
+                self.o2_lag_factor = check(factor, 1.5, 50.0)?;
             }
             Fault::OxygenSensorBias { lambda } => {
-                self.o2_bias_lambda = check(lambda, -0.5, 0.5, 0.0)?;
+                self.o2_bias_lambda = check_offset(lambda, 0.02, 0.5)?;
             }
             Fault::KnockSensorDead => self.knock_sensor_dead = true,
             Fault::VacuumLeak { diameter_mm } => {
-                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 30.0, 0.0)?);
+                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 0.5, 30.0)?);
             }
             Fault::InjectorClogged {
                 cylinder,
                 flow_fraction,
             } => {
                 let c = cyl(cylinder)?;
-                self.injector_flow[c] = check(flow_fraction, 0.0, 1.0, 1.0)?;
+                self.injector_flow[c] = check(flow_fraction, 0.0, 0.95)?;
             }
             Fault::IgnitionCoilWeak { cylinder, strength } => {
                 let c = cyl(cylinder)?;
-                self.coil_strength[c] = check(strength, 0.0, 1.0, 1.0)?;
+                self.coil_strength[c] = check(strength, 0.0, 0.9)?;
             }
             Fault::ThermostatStuckOpen => {
                 self.thermostat = ThermostatFault::StuckOpen;
@@ -334,24 +341,24 @@ impl FaultState {
                 self.active &= !(1 << (FaultId::ThermostatStuckOpen as u8));
             }
             Fault::TimingChainStretch { retard_deg } => {
-                self.cam_retard_deg = check(retard_deg, 0.0, 30.0, 0.0)?;
+                self.cam_retard_deg = check(retard_deg, 2.0, 30.0)?;
             }
             Fault::FuelPumpWeak { capacity_fraction } => {
-                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 1.0, 1.0)?;
+                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 0.9)?;
             }
             Fault::ExhaustRestriction { factor } => {
-                self.exhaust_restriction = check(factor, 1.0, 50.0, 1.0)?;
+                self.exhaust_restriction = check(factor, 1.5, 50.0)?;
             }
             Fault::LowCompression {
                 cylinder,
                 leak_fraction,
             } => {
                 let c = cyl(cylinder)?;
-                self.compression_leak[c] = check(leak_fraction, 0.0, 1.0, 0.0)?;
+                self.compression_leak[c] = check(leak_fraction, 0.05, 1.0)?;
             }
             Fault::BoostLeak { diameter_mm } => {
                 turbo_only()?;
-                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 0.0, 40.0, 0.0)?);
+                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 2.0, 40.0)?);
             }
             Fault::WastegateStuckClosed => {
                 turbo_only()?;
@@ -413,15 +420,31 @@ mod tests {
     #[test]
     fn undetectable_or_inapplicable_faults_are_rejected() {
         let mut f = FaultState::default();
-        // Neutral severities would report an active fault that changes nothing.
-        assert_eq!(
-            f.apply(Fault::VacuumLeak { diameter_mm: 0.0 }, 4, false),
-            Err(FaultError::InvalidParameter)
-        );
-        assert_eq!(
-            f.apply(Fault::OxygenSensorSlow { factor: 1.0 }, 4, false),
-            Err(FaultError::InvalidParameter)
-        );
+        // Severities below the detectable minimum would report an active fault that
+        // changes nothing.
+        for fault in [
+            Fault::VacuumLeak { diameter_mm: 0.0 },
+            Fault::VacuumLeak {
+                diameter_mm: 1.0e-19,
+            },
+            Fault::OxygenSensorSlow {
+                factor: 1.000_000_1,
+            },
+            Fault::InjectorClogged {
+                cylinder: 0,
+                flow_fraction: 0.999_999_94,
+            },
+            Fault::TimingChainStretch {
+                retard_deg: 1.0e-30,
+            },
+            Fault::MapSensorBias { kpa: -0.5 },
+        ] {
+            assert_eq!(f.apply(fault, 4, false), Err(FaultError::InvalidParameter));
+        }
+        assert!(f
+            .apply(Fault::MapSensorBias { kpa: -20.0 }, 4, false)
+            .is_ok());
+        assert_eq!(f.map_bias_pa, -20_000.0);
         // Turbo hardware faults on a naturally aspirated engine.
         assert_eq!(
             f.apply(Fault::BoostLeak { diameter_mm: 20.0 }, 4, false),

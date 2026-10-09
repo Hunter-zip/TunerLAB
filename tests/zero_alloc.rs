@@ -122,17 +122,70 @@ fn tick_is_allocation_free_in_every_operating_regime() {
             .unwrap();
         assert_eq!(run_counted(&mut sim, 5.0), 0, "faults");
 
-        // Vehicle drive-away, over-rev to destruction, failed engine.
+        // Light, high-gain dyno absorber (implicit absorber path) held at the redline
+        // (warning chatter and its rate-limited logging).
+        let redline = sim.spec().limits.redline_rpm;
         sim.update_controls(|c| {
+            c.load = LoadModel::Dyno(DynoParams {
+                target_rpm: redline,
+                absorber_inertia_kg_m2: 0.002,
+                kp_nm_per_rpm: 50.0,
+                ..DynoParams::default()
+            });
+        });
+        assert_eq!(run_counted(&mut sim, 2.0), 0, "light absorber at redline");
+
+        // Vehicle: slipping clutch at part load, drive in gear, coast with fuel cut and
+        // dashpot, then declutch (DFCO resume look-ahead, idle recovery).
+        sim.clear_faults();
+        sim.update_controls(|c| {
+            c.pedal = 0.4;
             c.load = LoadModel::Vehicle(VehicleParams {
                 gear: 1,
+                clutch: 0.5,
+                ..VehicleParams::default()
+            });
+        });
+        assert_eq!(run_counted(&mut sim, 2.0), 0, "slipping clutch");
+        sim.update_controls(|c| {
+            c.load = LoadModel::Vehicle(VehicleParams {
+                gear: 2,
                 ..VehicleParams::default()
             });
         });
         assert_eq!(run_counted(&mut sim, 3.0), 0, "vehicle");
+        sim.update_controls(|c| c.pedal = 0.0);
+        assert_eq!(run_counted(&mut sim, 3.0), 0, "coast with fuel cut");
+        sim.update_controls(|c| {
+            c.load = LoadModel::Vehicle(VehicleParams {
+                gear: 2,
+                clutch: 0.0,
+                ..VehicleParams::default()
+            });
+        });
+        assert_eq!(run_counted(&mut sim, 3.0), 0, "declutch");
+
+        // Overboost: stuck wastegate trips the latched fuel cut and stores P0234.
+        if sim.spec().turbo.is_some() {
+            sim.inject_fault(Fault::WastegateStuckClosed).unwrap();
+            sim.update_controls(|c| {
+                c.pedal = 1.0;
+                c.load = LoadModel::Dyno(DynoParams {
+                    target_rpm: 4500.0,
+                    ..DynoParams::default()
+                });
+            });
+            assert_eq!(run_counted(&mut sim, 4.0), 0, "overboost cut");
+            sim.clear_faults();
+        }
+
+        // Over-rev to destruction, failed engine.
         sim.update_calibration(|cal| cal.limiter.cut_rpm = 14_000.0)
             .unwrap();
-        sim.update_controls(|c| c.load = LoadModel::Neutral);
+        sim.update_controls(|c| {
+            c.pedal = 1.0;
+            c.load = LoadModel::Neutral;
+        });
         assert_eq!(run_counted(&mut sim, 10.0), 0, "over-rev / failure");
 
         // Key off and spin-down.

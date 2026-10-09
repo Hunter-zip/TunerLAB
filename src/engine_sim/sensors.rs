@@ -64,8 +64,11 @@ pub struct SensorReadings {
     pub battery_v: f32,
     /// Vehicle speed \[km/h\].
     pub vehicle_speed_kph: f32,
-    /// Clutch pedal position switch: pedal not fully released (vehicle mode only).
+    /// Clutch pedal top switch: pedal not fully released (vehicle mode only).
     pub clutch_pedal_pressed: bool,
+    /// Clutch pedal bottom (starter-interlock) switch: pedal fully depressed, driveline
+    /// open (vehicle mode only).
+    pub clutch_disengaged: bool,
     /// Park/neutral position switch: gearbox in neutral (always set off the vehicle).
     pub neutral: bool,
     /// Knock sensor signal, windowed per cylinder \[V-equivalent\].
@@ -103,6 +106,7 @@ impl SensorReadings {
             battery_v: 12.6,
             vehicle_speed_kph: 0.0,
             clutch_pedal_pressed: false,
+            clutch_disengaged: false,
             neutral: true,
             knock_signal: [0.0; MAX_CYLINDERS],
             segment_seq: 0,
@@ -201,10 +205,11 @@ impl SensorState {
         r.egt_c = approach(r.egt_c, plant.air.t_exh - ZERO_CELSIUS_K, dt, EGT_TAU_S);
         r.battery_v = plant.battery_v + 0.02 * rng.normal();
         r.vehicle_speed_kph = plant.crank.vehicle_speed * 3.6;
-        (r.clutch_pedal_pressed, r.neutral) = match &ctl.load {
-            // The top-of-travel switch opens within the last few percent of pedal travel.
-            LoadModel::Vehicle(v) => (v.clutch < 0.95, v.gear == 0),
-            LoadModel::Neutral | LoadModel::Dyno(_) => (false, true),
+        (r.clutch_pedal_pressed, r.clutch_disengaged, r.neutral) = match &ctl.load {
+            // The top switch opens within the last few percent of pedal travel, the bottom
+            // switch closes once the clutch carries no torque.
+            LoadModel::Vehicle(v) => (v.clutch < 0.95, v.clutch < 0.05, v.gear == 0),
+            LoadModel::Neutral | LoadModel::Dyno(_) => (false, false, true),
         };
         r.turbo_rpm = plant.air.turbo_omega * super::math::RAD_S_TO_RPM;
 

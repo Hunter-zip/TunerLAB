@@ -84,7 +84,15 @@ fn engine_starts_at_minus_ten_celsius() {
     start(&mut sim);
     run(&mut sim, 20.0);
     assert_eq!(sim.condition(), EngineCondition::Running);
-    assert!(sim.telemetry().rpm > 1000.0, "{}", sim.telemetry().rpm);
+    // The start flare must settle onto the cold fast-idle target (≈ 1250 rpm at −10 °C)
+    // instead of hanging above the idle window and setting a false high-idle code.
+    let rpm = average(&mut sim, 20.0, |t| t.rpm);
+    assert!((1050.0..1450.0).contains(&rpm), "cold idle {rpm}");
+    assert!(
+        sim.dtcs().is_empty(),
+        "{:?}",
+        sim.dtcs().iter().collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -395,7 +403,7 @@ fn dead_knock_sensor_is_detected_and_disables_protection() {
 fn weak_fuel_pump_starves_the_engine_at_full_load() {
     let mut sim = warm_na(17);
     sim.inject_fault(Fault::FuelPumpWeak {
-        capacity_fraction: 0.12,
+        capacity_fraction: 0.3,
     })
     .unwrap();
     dyno(&mut sim, 2000.0, 0.15);
@@ -738,4 +746,178 @@ fn status_key_renders_through_any_localizer() {
         language: Language::Pl,
     };
     assert_eq!(pl.text(sim.status_key()), sim.status_text(Language::Pl));
+}
+
+#[test]
+fn idle_control_holds_creep_speed_in_first_gear() {
+    let mut sim = warm_na(40);
+    drive_away(&mut sim);
+    // Pedal released, clutch up: the idle controller sets the creep speed.
+    vehicle(&mut sim, 1, 1.0, 0.0);
+    run(&mut sim, 15.0);
+    let rpm = average(&mut sim, 5.0, |t| t.rpm);
+    assert!((700.0..950.0).contains(&rpm), "creep idle {rpm}");
+    assert_eq!(sim.condition(), EngineCondition::Running);
+}
+
+#[test]
+fn closed_throttle_overrun_does_not_set_a_map_circuit_code() {
+    let mut sim = warm_na(41);
+    drive_away(&mut sim);
+    vehicle(&mut sim, 2, 1.0, 1.0);
+    while sim.telemetry().rpm < 6000.0 {
+        sim.tick(FRAME);
+    }
+    // Lift off in gear: the fuel cut and the dashpot run, MAP sits at the sensor floor.
+    vehicle(&mut sim, 2, 1.0, 0.0);
+    run(&mut sim, 12.0);
+    assert!(!sim.dtcs().contains(DtcCode::P0106));
+}
+
+#[test]
+fn engine_restarts_after_an_overboost_cut_stall() {
+    let mut sim = warm_turbo(42);
+    sim.inject_fault(Fault::WastegateStuckClosed).unwrap();
+    dyno(&mut sim, 4500.0, 1.0);
+    // The latched cut holds while the pedal stays down until the dyno stalls the engine.
+    for _ in 0..(20.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        if sim.telemetry().rpm < 1.0 {
+            break;
+        }
+    }
+    assert!(sim.dtcs().contains(DtcCode::P0234));
+    sim.clear_faults();
+    sim.update_controls(|c| {
+        c.load = LoadModel::Neutral;
+        c.pedal = 0.3;
+    });
+    start(&mut sim);
+    run(&mut sim, 3.0);
+    assert_eq!(sim.condition(), EngineCondition::Running);
+    // Fuelled (the rev limiter may cut individual samples once it free-revs).
+    let pw = average(&mut sim, 1.0, |t| t.injector_pulse_ms);
+    assert!(pw > 1.0, "mean pulse {pw} ms");
+}
+
+#[test]
+fn barometric_pressure_is_relearned_at_key_on() {
+    // Key on at altitude, then drive down to sea level before the next start.
+    let mut sim = warm_na(43);
+    sim.update_controls(|c| {
+        c.ignition_on = false;
+        c.ambient.pressure_pa = 70_000.0;
+    });
+    run(&mut sim, 20.0);
+    sim.update_controls(|c| c.ignition_on = true);
+    run(&mut sim, 3.0);
+    sim.update_controls(|c| c.ignition_on = false);
+    run(&mut sim, 2.0);
+    sim.update_controls(|c| c.ambient.pressure_pa = 101_325.0);
+    run(&mut sim, 20.0);
+    start(&mut sim);
+    dyno(&mut sim, 4000.0, 1.0);
+    run(&mut sim, 6.0);
+    assert!(!sim.dtcs().contains(DtcCode::P0106));
+}
+
+#[test]
+fn misfires_are_counted_with_the_clutch_held_down() {
+    let mut sim = warm_na(44);
+    sim.inject_fault(Fault::LowCompression {
+        cylinder: 1,
+        leak_fraction: 0.85,
+    })
+    .unwrap();
+    // Waiting at a light in first gear with the clutch pedal on the floor.
+    vehicle(&mut sim, 1, 0.0, 0.0);
+    run(&mut sim, 30.0);
+    assert!(sim.dtcs().contains(DtcCode::P0302));
+}
+
+#[test]
+fn clearing_codes_waits_for_a_cold_start_to_rerun_the_thermostat_monitor() {
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 45).unwrap();
+    sim.inject_fault(Fault::ThermostatStuckOpen).unwrap();
+    start(&mut sim);
+    dyno(&mut sim, 2500.0, 0.3);
+    run(&mut sim, 240.0);
+    assert!(sim.dtcs().contains(DtcCode::P0128));
+    sim.clear_dtcs();
+    run(&mut sim, 30.0);
+    assert!(!sim.dtcs().contains(DtcCode::P0128));
+}
+
+#[test]
+fn warnings_near_a_threshold_do_not_flood_the_event_log() {
+    let mut sim = warm_na(46);
+    let redline = sim.spec().limits.redline_rpm;
+    dyno(&mut sim, redline, 1.0);
+    run(&mut sim, 3.0);
+    let cursor = sim.events().next_seq();
+    run(&mut sim, 2.0);
+    let logged = sim.events().since(cursor).count();
+    assert!(logged < 20, "{logged} events in 2 s at the redline");
+}
+
+#[test]
+fn warm_idle_regulates_on_the_thermostat() {
+    let mut sim = warm_na(47);
+    run(&mut sim, 300.0);
+    let t = sim.telemetry();
+    assert!(
+        (85.0..100.0).contains(&t.coolant_temp_c),
+        "coolant {}",
+        t.coolant_temp_c
+    );
+    assert!(t.thermostat_pos > 0.0, "thermostat {}", t.thermostat_pos);
+}
+
+#[test]
+fn catalyst_lights_off_at_cold_idle_and_passes_its_monitor() {
+    let mut sim =
+        EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 48).unwrap();
+    start(&mut sim);
+    run(&mut sim, 180.0);
+    assert!(
+        sim.telemetry().catalyst_temp_c > 300.0,
+        "catalyst {}",
+        sim.telemetry().catalyst_temp_c
+    );
+    // Warm restart after a short stop (the catalyst cools faster than the coolant).
+    sim.update_controls(|c| c.ignition_on = false);
+    run(&mut sim, 600.0);
+    start(&mut sim);
+    run(&mut sim, 400.0);
+    assert!(!sim.dtcs().contains(DtcCode::P0420));
+}
+
+#[test]
+fn stalled_engine_in_gear_carries_no_phantom_load() {
+    let mut sim = warm_na(49);
+    sim.update_controls(|c| {
+        c.load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            clutch: 1.0,
+            brake: 1.0,
+            ..VehicleParams::default()
+        });
+    });
+    run(&mut sim, 5.0);
+    assert_eq!(sim.condition(), EngineCondition::Stalled);
+    let t = sim.telemetry();
+    assert!(t.load_torque_nm.abs() < 1.0, "load {}", t.load_torque_nm);
+    // Releasing the brake must not launch the car or spin the dead engine.
+    sim.update_controls(|c| {
+        c.load = LoadModel::Vehicle(VehicleParams {
+            gear: 1,
+            clutch: 1.0,
+            brake: 0.0,
+            ..VehicleParams::default()
+        });
+    });
+    run(&mut sim, 2.0);
+    assert!(sim.telemetry().vehicle_speed_kph < 0.2);
+    assert!(sim.telemetry().rpm < 20.0);
 }

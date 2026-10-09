@@ -481,7 +481,7 @@ impl Calibration {
                 NOMINAL_IAT_K + charge_temp_blend.lookup(rpm) * (NOMINAL_ECT_K - NOMINAL_IAT_K);
             let ve_ecu = air * R_AIR * t_est / (map_pa * v_cyl);
             let error = 0.04 * (0.0011 * rpm + 0.6).sin() * (0.035 * map_kpa).cos();
-            round_to(ve_ecu * (1.0 + error), 0.001)
+            round_to(clampf(ve_ecu * (1.0 + error), 0.05, 2.0), 0.001)
         });
 
         // Spark: MBT located by sweeping the true cycle model, then limited to the
@@ -725,7 +725,7 @@ impl Calibration {
                 20_000.0,
             ),
             ("engine.stoich_afr", self.engine.stoich_afr, 5.0, 20.0),
-            ("injector.flow_g_s", self.injector.flow_g_s, 0.1, 100.0),
+            ("injector.flow_g_s", self.injector.flow_g_s, 0.05, 150.0),
             ("injector.max_duty", self.injector.max_duty, 0.1, 1.0),
             (
                 "injector.rated_pressure_kpa",
@@ -983,6 +983,40 @@ mod tests {
         assert!(t.lookup(0.0).is_finite());
         assert!(t.lookup(0.5).is_finite());
         assert!(t.lookup(1.0).is_finite());
+    }
+
+    #[test]
+    fn every_valid_spec_gets_a_valid_base_calibration() {
+        // Specs at the limits of EngineSpec::validate must never produce a base calibration
+        // that Calibration::validate rejects.
+        let edits: [fn(&mut EngineSpec); 9] = [
+            |s| {
+                s.limits.redline_rpm = 14_800.0;
+                s.limits.valve_float_rpm = 16_000.0;
+                s.limits.bearing_oil_per_krpm = 30_000.0;
+            },
+            |s| s.geometry.rotating_inertia_kg_m2 = 0.01,
+            |s| {
+                s.fuel_system.injector_dead_time_s = 3.0e-3;
+                s.fuel_system.injector_dead_time_slope_s_per_v = 1.0e-3;
+            },
+            |s| {
+                s.fuel_system.injector_dead_time_s = 0.0;
+                s.fuel_system.injector_dead_time_slope_s_per_v = 0.0;
+            },
+            |s| s.fuel.stoich_afr = 6.4,
+            |s| s.fuel.stoich_afr = 17.2,
+            |s| s.fuel_system.injector_flow_kg_s = 1.0e-4,
+            |s| s.breathing.ram_gain = 1.0,
+            |s| s.breathing.base_ve = 1.5,
+        ];
+        for (i, edit) in edits.iter().enumerate() {
+            let mut spec = EngineSpec::naturally_aspirated_2l();
+            edit(&mut spec);
+            assert_eq!(spec.validate(), Ok(()), "edit {i} must be a valid spec");
+            let cal = Calibration::base_for(&spec);
+            assert_eq!(cal.validate(), Ok(()), "edit {i}");
+        }
     }
 
     #[test]

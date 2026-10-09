@@ -10,7 +10,7 @@ use super::calibration::Calibration;
 use super::controls::Controls;
 use super::dtc::{DtcCode, DtcSet};
 use super::events::{EventKind, EventLog};
-use super::math::{approach, clampf, finite_or, smoothstep};
+use super::math::{approach, clampf, finite_or, flush_tiny, smoothstep};
 use super::sensors::SensorReadings;
 use super::spec::MAX_CYLINDERS;
 use super::thermo::{R_AIR, ZERO_CELSIUS_K};
@@ -46,16 +46,11 @@ const BOOST_INTEGRATION_BAND_KPA: f32 = 25.0;
 const IDLE_SPARK_BLEND_TAU_S: f32 = 0.3;
 /// Authority of the proportional idle-valve term \[duty\].
 const IDLE_P_LIMIT: f32 = 0.12;
-/// With the driveline engaged, idle speed control runs only below this vehicle speed
-/// \[km/h\]; while coasting in gear the wheels, not the idle valve, set engine speed, and
-/// an integrator left running there winds the valve shut and stalls the engine when the
-/// driver declutches.
-const IDLE_MAX_VEHICLE_SPEED_KPH: f32 = 4.0;
-/// Extra idle-air ("dashpot") opening held while driving or coasting \[duty\]. When the
-/// driver lifts off or declutches, the decaying extra air catches the falling engine
-/// speed instead of letting it undershoot into a stall.
+/// Extra idle-air ("dashpot") opening held while the pedal is pressed or fuel is cut on
+/// overrun \[duty\]. When the driver lifts off or declutches, the decaying extra air
+/// catches the falling engine speed instead of letting it undershoot into a stall.
 const DASHPOT_DUTY: f32 = 0.08;
-/// Decay time constant of the dashpot air once idle control takes over \[s\].
+/// Decay time constant of the dashpot air once the pedal is released and fuel is back \[s\].
 const DASHPOT_TAU_S: f32 = 1.5;
 /// Look-ahead of the DFCO resume decision \[s\]: injection, wall-film build-up and the first
 /// combustion need ≈ 2 engine cycles, so at a fast speed decay the fuel must come back
@@ -72,22 +67,40 @@ const BARO_WOT_LOSS_KPA: f32 = 1.0;
 /// Overboost fuel cut, once triggered, stays latched until the pedal falls below this \[%\].
 const OVERBOOST_RELEASE_PEDAL_PCT: f32 = 20.0;
 /// MAP reading at or below which the sensor is judged shorted low while running \[kPa\]
-/// (the 3-bar transfer function bottoms out at 10 kPa).
+/// (the 3-bar transfer function bottoms out at 10 kPa). Closed-throttle overrun can
+/// legitimately pull the manifold that low, so the check is suspended there.
 const MAP_LOW_LIMIT_KPA: f32 = 10.5;
 /// IAT reading below which the circuit is judged open (the pull-up drives the input to
 /// the cold rail at −50 °C, outside the −40 °C operating range) \[°C\].
 const IAT_OPEN_LIMIT_C: f32 = -45.0;
-/// Air mass the engine must have consumed per kelvin of required warm-up before the
-/// thermostat monitor (P0128) may judge the coolant too cold \[kg/K\]. A healthy engine
-/// needs ≈ 0.05 kg/K at idle (the heat rejected to coolant is roughly proportional to
-/// fuel and hence air consumed); twice that is the debounce margin.
-const THERMOSTAT_MONITOR_AIR_PER_K: f32 = 0.11;
+/// Off-idle air mass the engine must have consumed per kelvin of required warm-up before
+/// the thermostat monitor (P0128) may judge the coolant too cold \[kg/K\]. Warming the
+/// ≈ 47 kJ/K of metal, coolant and oil takes ≈ 0.05 kg of air per kelvin (≈ 0.9 MJ of
+/// coolant heat per kg of air burned); twice that is the debounce margin. The figure is
+/// for 25 °C ambient and grows with colder air (see [`Ecu::update`]).
+const THERMOSTAT_MONITOR_AIR_PER_K: f64 = 0.11;
 /// Coolant temperature a healthy thermostat must reach for the P0128 monitor \[°C\].
 const THERMOSTAT_MONITOR_C: f32 = 70.0;
-/// Time constant of the ECU's catalyst-temperature model (substrate heat-up) \[s\].
-const CATALYST_MODEL_TAU_S: f32 = 60.0;
+/// The thermostat monitor runs once per trip and only from a genuinely cold start: start
+/// coolant at least this far below [`THERMOSTAT_MONITOR_C`] \[K\].
+const THERMOSTAT_MONITOR_MIN_RISE_K: f32 = 10.0;
+/// Below this intake temperature at start the thermostat monitor is disabled, as CARB
+/// permits (≈ −7 °C): very cold air can hold a healthy engine below the threshold \[°C\].
+const THERMOSTAT_MONITOR_MIN_IAT_C: f32 = -7.0;
+/// Only off-idle airflow counts towards the thermostat monitor: a long idle in the cold
+/// legitimately keeps a healthy engine cool \[kg/s\] (≈ 2× hot-idle airflow).
+const THERMOSTAT_MONITOR_MIN_AIRFLOW: f32 = 0.006;
+/// Heat capacity programmed into the ECU's catalyst-temperature model \[J/K\] (close-coupled
+/// substrate, matching the light-off behaviour of the catalyst it protects).
+const CATALYST_MODEL_CAPACITY: f64 = 600.0;
+/// Shell heat-loss conductance of the ECU's catalyst model \[W/K\].
+const CATALYST_MODEL_LOSS: f64 = 1.0;
+/// Exhaust specific heat used by the catalyst model \[J/(kg·K)\].
+const CATALYST_MODEL_CP: f64 = 1150.0;
 /// Modelled catalyst temperature above which the P0420 efficiency monitor runs \[°C\].
-const CATALYST_MONITOR_MIN_C: f32 = 400.0;
+const CATALYST_MONITOR_MIN_C: f64 = 400.0;
+/// The catalyst monitor needs this long since start or a code clear \[s\].
+const CATALYST_MONITOR_DELAY_S: f32 = 120.0;
 
 /// ECU operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,9 +162,18 @@ pub(crate) struct Ecu {
     rpm_prev: f32,
     rpm_rate: f32,
     stopped_time: f32,
-    air_since_start_kg: f32,
+    /// Idle-valve position the stepper is parked at when the key goes off.
+    parked_idle_valve: f32,
+    /// Off-idle air consumed since the start (f64: per-step increments are ~10⁻⁶ kg).
+    air_since_start_kg: f64,
     ect_at_start_c: f32,
-    catalyst_model_c: f32,
+    iat_at_start_c: f32,
+    /// The thermostat monitor still has to decide this trip.
+    thermostat_monitor_pending: bool,
+    /// ECU catalyst-temperature model \[°C\] (f64: slow lag at the 0.25 ms step).
+    catalyst_model_c: f64,
+    catalyst_monitor_time: f32,
+    clutch_switch_prev: bool,
     pub knock_retard: [f32; MAX_CYLINDERS],
     pub knock_count: [u32; MAX_CYLINDERS],
     film_est: [f32; MAX_CYLINDERS],
@@ -205,9 +227,14 @@ impl Default for Ecu {
             rpm_prev: 0.0,
             rpm_rate: 0.0,
             stopped_time: 0.0,
+            parked_idle_valve: 0.0,
             air_since_start_kg: 0.0,
             ect_at_start_c: 0.0,
+            iat_at_start_c: 0.0,
+            thermostat_monitor_pending: false,
             catalyst_model_c: 0.0,
+            catalyst_monitor_time: 0.0,
+            clutch_switch_prev: false,
             knock_retard: [0.0; MAX_CYLINDERS],
             knock_count: [0; MAX_CYLINDERS],
             film_est: [0.0; MAX_CYLINDERS],
@@ -259,29 +286,30 @@ impl Ecu {
         self.idle_spark = 0.0;
         self.idle_blend = 0.0;
         self.idle_active = false;
-        self.dashpot = 0.0;
         self.rpm_prev = 0.0;
         self.rpm_rate = 0.0;
         self.stopped_time = 0.0;
         self.air_since_start_kg = 0.0;
-        self.knock_retard = [0.0; MAX_CYLINDERS];
+        self.thermostat_monitor_pending = false;
         self.film_est = [0.0; MAX_CYLINDERS];
         self.last_inj_kg = [0.0; MAX_CYLINDERS];
-        self.rev_cut = false;
-        self.dfco = false;
-        self.dfco_timer = 0.0;
-        self.post_cut_hold = 0.0;
         self.boost_int = 0.0;
-        self.overboost_cut = false;
         self.fan_on = false;
         self.reset_monitor_state();
         self.dtc_timers = [0.0; DtcCode::COUNT];
         self.clear_running_outputs();
     }
 
-    /// Zeroes the reported values that only exist while the engine runs (closed-loop state,
-    /// spark, VE, boost target, fuelling), so a stopped engine never shows stale live data.
+    /// Zeroes the state that only exists while the engine runs: reported live values
+    /// (closed-loop state, spark, VE, boost target, fuelling), so a stopped engine never
+    /// shows stale data, and the fuel-cut latches, so a restart never inherits a cut.
     fn clear_running_outputs(&mut self) {
+        self.rev_cut = false;
+        self.dfco = false;
+        self.dfco_timer = 0.0;
+        self.overboost_cut = false;
+        self.post_cut_hold = 0.0;
+        self.dashpot = 0.0;
         self.closed_loop = false;
         self.stft = 0.0;
         self.stft_int = 0.0;
@@ -306,7 +334,9 @@ impl Ecu {
     }
 
     /// Clears stored trouble codes, monitor progress and learned trims (scan-tool
-    /// "clear codes"): every monitor restarts from scratch, as after a real code clear.
+    /// "clear codes"), as on a real ECU: the misfire, O2-response and catalyst monitors
+    /// restart from scratch, an active overboost cut is released, and the thermostat
+    /// monitor (P0128) waits for the next cold start because it only runs during warm-up.
     pub(crate) fn clear_codes(&mut self) {
         self.dtcs.clear();
         self.dtc_timers = [0.0; DtcCode::COUNT];
@@ -314,6 +344,10 @@ impl Ecu {
         self.misfire_total = [0; MAX_CYLINDERS];
         self.knock_count = [0; MAX_CYLINDERS];
         self.reset_monitor_state();
+        self.overboost_cut = false;
+        self.thermostat_monitor_pending = false;
+        self.air_since_start_kg = 0.0;
+        self.catalyst_monitor_time = 0.0;
     }
 
     /// Forgets the short- and long-term fuel trims (adaptive fuel memory).
@@ -367,17 +401,26 @@ impl Ecu {
             if self.mode != EcuMode::Off {
                 self.power_down();
             }
+            // The unpowered idle stepper stays where the ECU parked it for the next start,
+            // so the manifold refills to barometric pressure soon after the engine stops.
+            cmd.idle_valve = self.parked_idle_valve;
             return cmd;
         }
         let n = cal.engine.cylinders.clamp(1, MAX_CYLINDERS);
+        let key_on = self.mode == EcuMode::Off;
         self.key_on_time += dt;
         let rpm = s.rpm;
+        // Only plausible readings (sea level to ≈ 4500 m) are ever learned as baro.
+        let baro_plausible = (55.0..=110.0).contains(&s.map_kpa);
         if rpm < 50.0 {
-            // Engine stopped: once the manifold has refilled through the throttle and idle
-            // valve, the MAP sensor reads barometric pressure.
+            // Engine stopped: the MAP sensor reads barometric pressure, sampled at key-on
+            // (the manifold refilled during key-off) and, after a stall with the key on,
+            // once the manifold has had time to refill.
+            if key_on && baro_plausible {
+                self.baro_kpa = s.map_kpa;
+            }
             self.stopped_time += dt;
-            // Only settled, plausible readings (sea level to ≈ 4500 m) are accepted.
-            if self.stopped_time > BARO_LEARN_STOPPED_S && (55.0..=110.0).contains(&s.map_kpa) {
+            if self.stopped_time > BARO_LEARN_STOPPED_S && baro_plausible {
                 self.baro_kpa = approach(self.baro_kpa, s.map_kpa, dt, 0.2);
             }
         } else {
@@ -430,7 +473,12 @@ impl Ecu {
             if self.run_time == 0.0 {
                 self.air_since_start_kg = 0.0;
                 self.ect_at_start_c = s.ect_c;
-                self.catalyst_model_c = s.ect_c;
+                self.iat_at_start_c = s.iat_c;
+                self.thermostat_monitor_pending = s.ect_c
+                    < THERMOSTAT_MONITOR_C - THERMOSTAT_MONITOR_MIN_RISE_K
+                    && s.iat_c > THERMOSTAT_MONITOR_MIN_IAT_C;
+                self.catalyst_model_c = f64::from(s.ect_c);
+                self.catalyst_monitor_time = 0.0;
             }
             self.run_time += dt;
         } else {
@@ -468,10 +516,11 @@ impl Ecu {
             .filter(|(_, &f)| f)
         {
             *film += x_e * inj;
-            *film -= *film * evap_frac;
+            *film = flush_tiny(*film - *film * evap_frac);
         }
 
         let base_idle_valve = clampf(cal.idle_valve_base.lookup(ect), 0.0, 1.0);
+        self.parked_idle_valve = clampf(base_idle_valve + CRANKING_IDLE_AIR, 0.0, 1.0);
         self.monitor(
             DtcCode::P0113,
             s.iat_c < IAT_OPEN_LIMIT_C,
@@ -647,15 +696,13 @@ impl Ecu {
         let ic = &cal.idle;
         // Clutch and neutral switches tell the ECU whether the wheels hold the engine speed.
         let driveline_engaged = !s.neutral && !s.clutch_pedal_pressed;
-        let free_engine = !driveline_engaged || s.vehicle_speed_kph < IDLE_MAX_VEHICLE_SPEED_KPH;
-        self.idle_active =
-            pedal < 1.0 && rpm < idle_target + ic.window_rpm && !self.dfco && free_engine;
-        // Dashpot: full extra air while driving or coasting, decaying once idle control is
-        // in charge; with the integrator frozen outside idle this restores a safe opening.
-        if self.idle_active {
-            self.dashpot = approach(self.dashpot, 0.0, dt, DASHPOT_TAU_S);
-        } else {
+        self.idle_active = pedal < 1.0 && rpm < idle_target + ic.window_rpm && !self.dfco;
+        // Dashpot: full extra air while the pedal is pressed or fuel is cut on overrun,
+        // decaying once the pedal is released and fuel is back.
+        if self.dfco || pedal >= 1.0 {
             self.dashpot = DASHPOT_DUTY;
+        } else {
+            self.dashpot = approach(self.dashpot, 0.0, dt, DASHPOT_TAU_S);
         }
         let idle_err = idle_target - rpm;
         let mut idle_valve = base_idle_valve + self.idle_int + self.dashpot;
@@ -668,7 +715,13 @@ impl Ecu {
             } else {
                 0.25
             };
-            self.idle_int = clampf(self.idle_int + gain * ic.ki * idle_err * dt, -0.3, 0.5);
+            // In gear with the clutch up the wheels can hold the engine above target while
+            // coasting; the integrator must not wind the valve shut there, or the engine
+            // stalls when the driver declutches. Anti-stall (opening) action stays active.
+            let coasting = driveline_engaged && idle_err < -IDLE_INTEGRATION_BAND_RPM;
+            if !coasting {
+                self.idle_int = clampf(self.idle_int + gain * ic.ki * idle_err * dt, -0.3, 0.5);
+            }
             self.idle_spark = clampf(
                 ic.spark_gain * idle_err,
                 -ic.spark_limit_deg,
@@ -760,10 +813,15 @@ impl Ecu {
         // Misfire monitor enable conditions (as in production OBD): no throttle transient,
         // no fuel cut, and no closed-throttle deceleration above idle, where dilution-driven
         // partial burns and torque reversals would be misread as misfires.
-        // A slipping or just-engaged clutch jerks the crank like a misfire does.
+        // A clutch being let in or out (switch edges, or partly engaged in gear) jerks the
+        // crank like a misfire does; a fully depressed clutch leaves it as clean as neutral.
+        let clutch_edge = s.clutch_pedal_pressed != self.clutch_switch_prev;
+        self.clutch_switch_prev = s.clutch_pedal_pressed;
+        let clutch_slipping = !s.neutral && s.clutch_pedal_pressed && !s.clutch_disengaged;
         let transient = (pedal - self.last_pedal).abs() > 0.5
             || cut
-            || s.clutch_pedal_pressed
+            || clutch_edge
+            || clutch_slipping
             || (pedal < 1.0 && rpm > idle_target + 300.0);
         self.last_pedal = pedal;
         self.misfire_holdoff = if transient {
@@ -790,23 +848,43 @@ impl Ecu {
             now,
             log,
         );
-        // Thermostat monitor: compares the coolant temperature with the warm-up a healthy
-        // engine must have achieved for the air (≈ fuel heat) consumed since the start.
-        self.air_since_start_kg += air * rpm / 120.0 * n as f32 * dt;
-        let warmup_needed_k = (THERMOSTAT_MONITOR_C - self.ect_at_start_c).max(0.0);
-        let warmup_due =
-            self.air_since_start_kg > THERMOSTAT_MONITOR_AIR_PER_K * warmup_needed_k + 0.5;
+        // Thermostat monitor (once per trip, cold starts only): compares the coolant
+        // temperature with the warm-up a healthy engine must have achieved for the off-idle
+        // air (≈ fuel heat) consumed since the start. Colder air carries more heat away, so
+        // the required air grows with (70 °C − IAT) relative to the 25 °C calibration.
+        let airflow = air * rpm / 120.0 * n as f32;
+        if self.thermostat_monitor_pending {
+            if ect >= THERMOSTAT_MONITOR_C {
+                self.thermostat_monitor_pending = false;
+            } else if airflow > THERMOSTAT_MONITOR_MIN_AIRFLOW {
+                self.air_since_start_kg += f64::from(airflow * dt);
+            }
+        }
+        let ambient_factor = f64::from(clampf(
+            (THERMOSTAT_MONITOR_C - self.iat_at_start_c) / 45.0,
+            1.0,
+            2.0,
+        ));
+        let warmup_needed_k = f64::from((THERMOSTAT_MONITOR_C - self.ect_at_start_c).max(0.0));
+        let warmup_due = self.air_since_start_kg
+            > THERMOSTAT_MONITOR_AIR_PER_K * ambient_factor * warmup_needed_k + 0.5;
         self.monitor(
             DtcCode::P0128,
-            warmup_due && ect < THERMOSTAT_MONITOR_C,
+            self.thermostat_monitor_pending && warmup_due && ect < THERMOSTAT_MONITOR_C,
             5.0,
             dt,
             now,
             log,
         );
+        if self.dtcs.contains(DtcCode::P0128) {
+            self.thermostat_monitor_pending = false;
+        }
         self.monitor(DtcCode::P0219, rpm > lim.cut_rpm + 500.0, 0.3, dt, now, log);
+        // Not while fuel is cut (e.g. the latched overboost cut): no boost is expected then.
         let underboost = turbo
             && cal.boost.enabled
+            && !cut
+            && self.post_cut_hold <= 0.0
             && pedal > 80.0
             && rpm > 3000.0
             && self.boost_target_kpa - map_kpa > 30.0;
@@ -817,8 +895,9 @@ impl Ecu {
         if !turbo && s.throttle_pct > 80.0 && rpm < 2500.0 {
             self.baro_kpa = approach(self.baro_kpa, map_kpa + BARO_WOT_LOSS_KPA, dt, 2.0);
         }
-        let map_implausible =
-            (!turbo && map_kpa > self.baro_kpa + 15.0) || s.map_kpa <= MAP_LOW_LIMIT_KPA;
+        let overrun = self.dfco || (pedal < 1.0 && rpm > idle_target + 300.0);
+        let map_implausible = (!turbo && map_kpa > self.baro_kpa + 15.0)
+            || (s.map_kpa <= MAP_LOW_LIMIT_KPA && !overrun);
         let idle_map_high = self.idle_active && rpm > 600.0 && map_kpa > 0.85 * self.baro_kpa;
         self.monitor(
             DtcCode::P0106,
@@ -837,13 +916,22 @@ impl Ecu {
             now,
             log,
         );
-        // Catalyst monitor runs only once the ECU's substrate-temperature model (a lag of
-        // the exhaust temperature) says the catalyst must be lit off.
-        self.catalyst_model_c = approach(self.catalyst_model_c, s.egt_c, dt, CATALYST_MODEL_TAU_S);
+        // Catalyst monitor runs only once the ECU's substrate-temperature model says the
+        // catalyst must be lit off. The model is a lumped energy balance driven by the
+        // estimated exhaust flow: C·dT/dt = ṁ_exh·c_p·(T_egt − T) − UA·(T − T_iat).
+        let exhaust_flow =
+            f64::from(airflow * (1.0 + 1.0 / (cal.engine.stoich_afr * lambda_target)));
+        let model = self.catalyst_model_c;
+        self.catalyst_model_c = model
+            + f64::from(dt)
+                * (exhaust_flow * CATALYST_MODEL_CP * (f64::from(s.egt_c) - model)
+                    - CATALYST_MODEL_LOSS * (model - f64::from(s.iat_c)))
+                / CATALYST_MODEL_CAPACITY;
+        self.catalyst_monitor_time += dt;
         self.monitor(
             DtcCode::P0420,
             cl_on
-                && self.run_time > 120.0
+                && self.catalyst_monitor_time > CATALYST_MONITOR_DELAY_S
                 && self.catalyst_model_c > CATALYST_MONITOR_MIN_C
                 && s.rear_o2_activity > 0.6,
             10.0,
