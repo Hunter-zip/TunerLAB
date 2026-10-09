@@ -110,11 +110,14 @@ impl EventLog {
 pub struct CylinderEvent {
     /// Monotonic sequence number.
     pub seq: u64,
-    /// Simulation time at which the cycle was computed (start of compression) \[s\].
+    /// Simulation time at which the crank crossed this cylinder's start of compression
+    /// (interpolated within the physics step) \[s\].
     pub time_s: f64,
-    /// Delay from `time_s` to this cylinder's firing TDC \[s\].
+    /// Predicted delay from `time_s` to this cylinder's firing TDC at the cycle-mean crank
+    /// speed \[s\].
     pub time_to_tdc_s: f32,
-    /// Delay from `time_s` to exhaust valve opening (start of the exhaust pulse) \[s\].
+    /// Predicted delay from `time_s` to exhaust valve opening (start of the exhaust pulse)
+    /// at the cycle-mean crank speed \[s\].
     pub time_to_evo_s: f32,
     /// Zero-based cylinder index.
     pub cylinder: u8,

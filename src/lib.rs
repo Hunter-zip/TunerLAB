@@ -47,12 +47,12 @@
 
 pub mod engine_sim;
 
-pub use engine_sim::calibration::Calibration;
+pub use engine_sim::calibration::{Calibration, CalibrationError};
 pub use engine_sim::controls::{Ambient, Controls, DynoParams, LoadModel, VehicleParams};
 pub use engine_sim::dtc::DtcCode;
-pub use engine_sim::faults::{Fault, FaultId};
-pub use engine_sim::i18n::{Language, Localize, MessageKey};
-pub use engine_sim::spec::EngineSpec;
+pub use engine_sim::faults::{Fault, FaultError, FaultId};
+pub use engine_sim::i18n::{Language, Localize, Localizer, MessageKey, StaticLocalizer};
+pub use engine_sim::spec::{EngineSpec, SpecError};
 pub use engine_sim::status::{EngineCondition, FailureCause, Warning, Warnings};
 pub use engine_sim::telemetry::Telemetry;
 pub use engine_sim::{EngineSim, SimError};

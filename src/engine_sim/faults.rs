@@ -15,45 +15,45 @@ use super::spec::MAX_CYLINDERS;
 pub enum Fault {
     /// MAP sensor reads high (positive) or low (negative) by a constant offset.
     MapSensorBias {
-        /// Offset \[kPa\], magnitude 2–100.
+        /// Offset \[kPa\], magnitude 3–100.
         kpa: f32,
     },
     /// Coolant temperature sensor offset (e.g. corroded connector).
     CoolantSensorBias {
-        /// Offset \[K\], magnitude 3–80; negative reads colder than reality.
+        /// Offset \[K\], magnitude 5–80; negative reads colder than reality.
         kelvin: f32,
     },
     /// Intake air temperature sensor open circuit (reads −50 °C, below the sensor range).
     IntakeAirSensorOpen,
     /// Ageing wide-band O2 sensor with a slow response.
     OxygenSensorSlow {
-        /// Multiplier on the response time constant, 1.5–50.
+        /// Multiplier on the response time constant, 2–50.
         factor: f32,
     },
     /// O2 sensor reading offset (exhaust leak upstream of the sensor reads lean).
     OxygenSensorBias {
-        /// Offset in λ, magnitude 0.02–0.5.
+        /// Offset in λ, magnitude 0.03–0.5.
         lambda: f32,
     },
     /// Knock sensor disconnected: no knock feedback.
     KnockSensorDead,
     /// Unmetered air entering the intake manifold (cracked hose, PCV valve).
     VacuumLeak {
-        /// Equivalent hole diameter \[mm\], 0.5–30.
+        /// Equivalent hole diameter \[mm\], 2–30.
         diameter_mm: f32,
     },
     /// Partially clogged injector.
     InjectorClogged {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Remaining flow fraction, 0–0.95.
+        /// Remaining flow fraction, 0–0.9.
         flow_fraction: f32,
     },
     /// Ignition coil with reduced secondary output (cracked housing, shorted turns).
     IgnitionCoilWeak {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Remaining output fraction, 0–0.9.
+        /// Remaining output fraction, 0–0.5 (misfires appear at high cylinder density).
         strength: f32,
     },
     /// Thermostat stuck open: engine never reaches operating temperature.
@@ -62,12 +62,13 @@ pub enum Fault {
     ThermostatStuckClosed,
     /// Stretched timing chain retarding the camshaft.
     TimingChainStretch {
-        /// Cam retard [crank deg], 2–30.
+        /// Cam retard [crank deg], 3–30.
         retard_deg: f32,
     },
     /// Worn fuel pump that cannot meet high-load demand.
     FuelPumpWeak {
-        /// Remaining capacity fraction, 0.05–0.9.
+        /// Remaining capacity fraction at regulator pressure, 0.05–0.45 (pumps are sized
+        /// ≈ 2× full-load demand, so the rail sags only below ≈ 50 %).
         capacity_fraction: f32,
     },
     /// Clogged catalyst / crushed exhaust pipe.
@@ -79,12 +80,12 @@ pub enum Fault {
     LowCompression {
         /// Zero-based cylinder index.
         cylinder: u8,
-        /// Fraction of trapped charge lost, 0.05–1.
+        /// Fraction of trapped charge lost, 0.15–1.
         leak_fraction: f32,
     },
     /// Leaking boost pipe or intercooler (turbo engines).
     BoostLeak {
-        /// Equivalent hole diameter \[mm\], 2–40.
+        /// Equivalent hole diameter \[mm\], 3–40.
         diameter_mm: f32,
     },
     /// Wastegate seized shut (turbo engines): uncontrolled boost.
@@ -305,32 +306,32 @@ impl FaultState {
         };
         match fault {
             Fault::MapSensorBias { kpa } => {
-                self.map_bias_pa = check_offset(kpa, 2.0, 100.0)? * 1000.0;
+                self.map_bias_pa = check_offset(kpa, 3.0, 100.0)? * 1000.0;
             }
             Fault::CoolantSensorBias { kelvin } => {
-                self.coolant_sensor_bias_k = check_offset(kelvin, 3.0, 80.0)?;
+                self.coolant_sensor_bias_k = check_offset(kelvin, 5.0, 80.0)?;
             }
             Fault::IntakeAirSensorOpen => self.iat_open_circuit = true,
             Fault::OxygenSensorSlow { factor } => {
-                self.o2_lag_factor = check(factor, 1.5, 50.0)?;
+                self.o2_lag_factor = check(factor, 2.0, 50.0)?;
             }
             Fault::OxygenSensorBias { lambda } => {
-                self.o2_bias_lambda = check_offset(lambda, 0.02, 0.5)?;
+                self.o2_bias_lambda = check_offset(lambda, 0.03, 0.5)?;
             }
             Fault::KnockSensorDead => self.knock_sensor_dead = true,
             Fault::VacuumLeak { diameter_mm } => {
-                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 0.5, 30.0)?);
+                self.vacuum_leak_area_m2 = hole_area(check(diameter_mm, 2.0, 30.0)?);
             }
             Fault::InjectorClogged {
                 cylinder,
                 flow_fraction,
             } => {
                 let c = cyl(cylinder)?;
-                self.injector_flow[c] = check(flow_fraction, 0.0, 0.95)?;
+                self.injector_flow[c] = check(flow_fraction, 0.0, 0.9)?;
             }
             Fault::IgnitionCoilWeak { cylinder, strength } => {
                 let c = cyl(cylinder)?;
-                self.coil_strength[c] = check(strength, 0.0, 0.9)?;
+                self.coil_strength[c] = check(strength, 0.0, 0.5)?;
             }
             Fault::ThermostatStuckOpen => {
                 self.thermostat = ThermostatFault::StuckOpen;
@@ -341,10 +342,10 @@ impl FaultState {
                 self.active &= !(1 << (FaultId::ThermostatStuckOpen as u8));
             }
             Fault::TimingChainStretch { retard_deg } => {
-                self.cam_retard_deg = check(retard_deg, 2.0, 30.0)?;
+                self.cam_retard_deg = check(retard_deg, 3.0, 30.0)?;
             }
             Fault::FuelPumpWeak { capacity_fraction } => {
-                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 0.9)?;
+                self.fuel_pump_capacity = check(capacity_fraction, 0.05, 0.45)?;
             }
             Fault::ExhaustRestriction { factor } => {
                 self.exhaust_restriction = check(factor, 1.5, 50.0)?;
@@ -354,11 +355,11 @@ impl FaultState {
                 leak_fraction,
             } => {
                 let c = cyl(cylinder)?;
-                self.compression_leak[c] = check(leak_fraction, 0.05, 1.0)?;
+                self.compression_leak[c] = check(leak_fraction, 0.15, 1.0)?;
             }
             Fault::BoostLeak { diameter_mm } => {
                 turbo_only()?;
-                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 2.0, 40.0)?);
+                self.boost_leak_area_m2 = hole_area(check(diameter_mm, 3.0, 40.0)?);
             }
             Fault::WastegateStuckClosed => {
                 turbo_only()?;

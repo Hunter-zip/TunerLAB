@@ -24,7 +24,8 @@ pub const COOLANT_POINTS: usize = 8;
 /// Errors from [`Calibration::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationError {
-    /// A table axis is not strictly increasing or contains non-finite values.
+    /// A table axis is not strictly increasing, contains non-finite values or exceeds
+    /// ±10⁶.
     InvalidAxis(&'static str),
     /// A table value or scalar is not finite or outside its range.
     InvalidValue(&'static str),
@@ -783,8 +784,9 @@ impl Calibration {
                 0.01,
                 10.0,
             ),
+            // Fuel must come back above 500 rpm: blames the cut speed of the pair.
             (
-                "limiter.hysteresis_rpm",
+                "limiter.cut_rpm",
                 lim.cut_rpm - lim.hysteresis_rpm,
                 500.0,
                 15_000.0,
@@ -832,7 +834,7 @@ impl Calibration {
                 return Err(CalibrationError::InvalidValue(name));
             }
         }
-        let curves: [(&'static str, bool, bool); 16] = [
+        let curves: [(&'static str, bool, bool); 14] = [
             (
                 "injector.dead_time_ms",
                 self.injector.dead_time_ms.axis_valid(),
@@ -903,17 +905,23 @@ impl Calibration {
                 b.base_duty.axis_valid(),
                 b.base_duty.values_within(0.0, 1.0),
             ),
+        ];
+        // Axes with a physical range (battery voltage, pedal travel).
+        let ranged_axes: [(&'static str, bool); 2] = [
             (
-                "injector.dead_time_ms axis",
+                "injector.dead_time_ms.axis",
                 self.injector.dead_time_ms.axis_within(0.0, 30.0),
-                true,
             ),
             (
-                "throttle_map axis",
+                "throttle_map.axis",
                 self.throttle_map.axis_within(0.0, 100.0),
-                true,
             ),
         ];
+        for (name, ok) in ranged_axes {
+            if !ok {
+                return Err(CalibrationError::InvalidValue(name));
+            }
+        }
         for (name, axis_ok, values_ok) in curves {
             if !axis_ok {
                 return Err(CalibrationError::InvalidAxis(name));

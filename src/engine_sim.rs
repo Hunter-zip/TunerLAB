@@ -254,8 +254,9 @@ impl EngineSim {
 
         let omega = self.plant.crank.omega;
         // Delays from the cycle computation (start of compression, BDC) to firing TDC and
-        // to exhaust valve opening, for audio scheduling.
-        let omega_ev = omega.max(1.0);
+        // to exhaust valve opening, for audio scheduling, at the cycle-mean crank speed (the
+        // instantaneous speed at BDC sits in a firing-ripple trough).
+        let omega_ev = self.plant.omega_cycle_mean.max(1.0);
         let time_to_tdc = core::f32::consts::PI / omega_ev;
         let evo_atdc = (180.0 - self.spec.valves.evo_bbdc_deg).to_radians();
         let time_to_evo = (core::f32::consts::PI + evo_atdc) / omega_ev;
@@ -275,7 +276,7 @@ impl EngineSim {
             );
             self.cylinder_events.push(CylinderEvent {
                 seq: 0,
-                time_s: now,
+                time_s: now + f64::from(self.plant.fire_fraction[c] * dt),
                 time_to_tdc_s: time_to_tdc,
                 time_to_evo_s: time_to_evo,
                 cylinder: c as u8,
@@ -390,8 +391,12 @@ impl EngineSim {
             Warning::HighOilTemp,
             p.thermal.t_oil > ZERO_CELSIUS_K + 135.0,
         );
-        // Not during commanded fuel cuts, whose film-only cycles are lean by design.
-        let fuel_cut = self.ecu.rev_cut || self.ecu.dfco || self.ecu.overboost_cut;
+        // Not during commanded fuel cuts, whose film-only cycles are lean by design, nor
+        // while their lean gas is still being flushed through the exhaust.
+        let fuel_cut = self.ecu.rev_cut
+            || self.ecu.dfco
+            || self.ecu.overboost_cut
+            || self.ecu.post_cut_hold > 0.0;
         w.set(
             Warning::LeanUnderLoad,
             running
@@ -426,7 +431,7 @@ impl EngineSim {
         w.set(Warning::Misfire, running && self.misfire_hold > 0.0);
         w.set(
             Warning::InjectorDutyHigh,
-            running && self.ecu.injector_duty > 0.88,
+            running && !fuel_cut && self.ecu.injector_duty > 0.88,
         );
         w.set(
             Warning::CatalystOverheat,
@@ -603,8 +608,9 @@ impl EngineSim {
         &self.ecu.dtcs
     }
 
-    /// Clears stored trouble codes, OBD monitor progress and learned fuel trims (scan-tool
-    /// function).
+    /// Clears stored trouble codes and learned fuel trims (scan-tool function). As on a
+    /// real ECU the misfire, O2-response and catalyst monitors restart, an active overboost
+    /// cut is released, and the thermostat monitor waits for the next cold start.
     pub fn clear_dtcs(&mut self) {
         self.ecu.clear_codes();
         self.update_warnings();

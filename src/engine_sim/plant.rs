@@ -157,6 +157,12 @@ pub(crate) struct Plant {
     pub peak_pressure_mean_bar: f32,
     pub torque: TorqueBreakdown,
     pub segment: CrankSegment,
+    /// Fraction of the last step at which each cylinder that fired this step crossed its
+    /// start of compression (for sub-step event time stamps).
+    pub fire_fraction: [f32; MAX_CYLINDERS],
+    /// Crank speed averaged over about one engine cycle \[rad/s\]: the speed at which
+    /// the next half revolution will be covered, free of the firing-pulse ripple.
+    pub omega_cycle_mean: f32,
     pub catalyst_efficiency: f32,
     hc_store_j: f32,
     o2_store_kg: f32,
@@ -250,6 +256,8 @@ impl Plant {
             peak_pressure_mean_bar: 1.0,
             torque: TorqueBreakdown::default(),
             segment: CrankSegment::default(),
+            fire_fraction: [0.0; MAX_CYLINDERS],
+            omega_cycle_mean: 0.0,
             catalyst_efficiency: 0.0,
             hc_store_j: 0.0,
             o2_store_kg: 0.0,
@@ -451,6 +459,9 @@ impl Plant {
             dt,
         );
         let dtheta = self.crank.omega * dt;
+        // One engine cycle (4π) at the current speed, bounded for standstill.
+        let cycle_s = clampf(CYCLE_RAD / self.omega_cycle_mean.max(1.0), 0.02, 1.0);
+        self.omega_cycle_mean = approach(self.omega_cycle_mean, self.crank.omega, dt, cycle_s);
         if self.crank.omega <= 0.0 {
             // A stopped crank has no gas-exchange cycle: the last cycle's stored work must
             // not keep acting as a phantom torque on it.
@@ -465,7 +476,9 @@ impl Plant {
             for pos in 0..n {
                 let c = self.firing_seq[pos];
                 let event = wrap_cycle(self.tdc_angle[c] - PI);
-                if wrap_cycle(event - theta_before) < dtheta {
+                let to_event = wrap_cycle(event - theta_before);
+                if to_event < dtheta {
+                    self.fire_fraction[c] = to_event / dtheta;
                     self.fire(c, cmd, ctl, faults, dmg, rng, dry_fraction);
                 }
             }

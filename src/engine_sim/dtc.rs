@@ -11,6 +11,8 @@ pub enum DtcCode {
     P0087,
     /// Manifold absolute pressure circuit range/performance.
     P0106,
+    /// Manifold absolute pressure circuit low input.
+    P0107,
     /// Intake air temperature circuit high input.
     P0113,
     /// Coolant temperature below thermostat regulating temperature.
@@ -59,13 +61,14 @@ pub enum DtcCode {
 
 impl DtcCode {
     /// Number of defined codes.
-    pub const COUNT: usize = 25;
+    pub const COUNT: usize = 26;
 
     /// Every code in storage order.
     pub const ALL: [DtcCode; Self::COUNT] = [
         DtcCode::P0016,
         DtcCode::P0087,
         DtcCode::P0106,
+        DtcCode::P0107,
         DtcCode::P0113,
         DtcCode::P0128,
         DtcCode::P0133,
@@ -96,6 +99,7 @@ impl DtcCode {
             Self::P0016 => "P0016",
             Self::P0087 => "P0087",
             Self::P0106 => "P0106",
+            Self::P0107 => "P0107",
             Self::P0113 => "P0113",
             Self::P0128 => "P0128",
             Self::P0133 => "P0133",

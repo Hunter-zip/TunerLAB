@@ -128,8 +128,8 @@ impl Localize for EngineCondition {
             Self::Running => pick(lang, "Running", "Silnik pracuje"),
             Self::Stalled => pick(
                 lang,
-                "Ignition on – engine stopped",
-                "Zapłon włączony – silnik stoi",
+                "Ignition on – engine not running",
+                "Zapłon włączony – silnik nie pracuje",
             ),
             Self::Failed(_) => pick(lang, "Engine failure", "Awaria silnika"),
         }
@@ -265,6 +265,11 @@ impl Localize for DtcCode {
                 lang,
                 "MAP sensor range/performance",
                 "Czujnik MAP – zakres/wiarygodność sygnału",
+            ),
+            Self::P0107 => pick(
+                lang,
+                "MAP sensor circuit low input",
+                "Czujnik MAP – niski sygnał wejściowy",
             ),
             Self::P0113 => pick(
                 lang,

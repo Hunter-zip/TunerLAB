@@ -600,9 +600,13 @@ fn healthy_engine_has_enough_oil_pressure_up_to_redline() {
 #[test]
 fn clear_dtcs_resets_codes_monitors_and_telemetry_at_once() {
     let mut sim = warm_na(27);
-    sim.inject_fault(Fault::IntakeAirSensorOpen).unwrap();
-    run(&mut sim, 4.0);
-    assert!(sim.dtcs().contains(DtcCode::P0113));
+    // Learn a real long-term trim first (O2 sensor reading lean), with its lean code.
+    sim.inject_fault(Fault::OxygenSensorBias { lambda: 0.3 })
+        .unwrap();
+    dyno(&mut sim, 2500.0, 0.2);
+    run(&mut sim, 90.0);
+    assert!(sim.telemetry().ltft_pct > 10.0);
+    assert!(sim.dtcs().contains(DtcCode::P0171));
     sim.clear_faults();
     sim.clear_dtcs();
     // The snapshot reflects the scan-tool action without waiting for a tick.
@@ -610,6 +614,10 @@ fn clear_dtcs_resets_codes_monitors_and_telemetry_at_once() {
     assert_eq!(sim.telemetry().dtc_count, 0);
     assert!(!sim.telemetry().warnings.contains(Warning::CheckEngine));
     assert_eq!(sim.telemetry().ltft_pct, 0.0);
+    assert_eq!(sim.telemetry().stft_pct, 0.0);
+    // With the fault gone, no code comes back.
+    run(&mut sim, 30.0);
+    assert!(sim.dtcs().is_empty());
 }
 
 #[test]
@@ -772,6 +780,77 @@ fn closed_throttle_overrun_does_not_set_a_map_circuit_code() {
     vehicle(&mut sim, 2, 1.0, 0.0);
     run(&mut sim, 12.0);
     assert!(!sim.dtcs().contains(DtcCode::P0106));
+    assert!(!sim.dtcs().contains(DtcCode::P0107));
+}
+
+#[test]
+fn map_sensor_faults_set_their_own_codes() {
+    // A MAP sensor reading 20 kPa high cannot drag the baro estimate along at WOT.
+    let mut sim = warm_na(50);
+    sim.inject_fault(Fault::MapSensorBias { kpa: 20.0 })
+        .unwrap();
+    dyno(&mut sim, 2000.0, 1.0);
+    run(&mut sim, 10.0);
+    assert!(sim.dtcs().contains(DtcCode::P0106));
+    // A sensor stuck at the low rail is a circuit fault, not a range/performance one.
+    let mut sim = warm_na(51);
+    sim.inject_fault(Fault::MapSensorBias { kpa: -100.0 })
+        .unwrap();
+    dyno(&mut sim, 2500.0, 0.3);
+    run(&mut sim, 4.0);
+    assert!(sim.dtcs().contains(DtcCode::P0107));
+}
+
+#[test]
+fn audio_event_timing_predicts_firing_tdc() {
+    use tunerlab_core::engine_sim::SUBSTEP_S;
+    for (pedal, rpm) in [(0.0, None), (0.6, Some(850.0))] {
+        let mut sim = warm_na(52);
+        if let Some(r) = rpm {
+            dyno(&mut sim, r, pedal);
+        }
+        run(&mut sim, 6.0);
+        // Record the unwrapped crank angle at every physics step.
+        let mut trace: Vec<(f64, f64)> = Vec::new();
+        let mut unwrapped = 0.0_f64;
+        let mut last = f64::from(sim.telemetry().crank_angle_deg);
+        let seq0 = sim.cylinder_events().next_seq();
+        for _ in 0..8000 {
+            sim.tick(SUBSTEP_S);
+            let a = f64::from(sim.telemetry().crank_angle_deg);
+            let mut d = a - last;
+            if d < -360.0 {
+                d += 720.0;
+            }
+            unwrapped += d;
+            last = a;
+            trace.push((sim.time_s(), unwrapped));
+        }
+        let angle_at = |t: f64| -> Option<f64> {
+            let i = trace.iter().position(|(tt, _)| *tt >= t)?;
+            if i == 0 {
+                return None;
+            }
+            let (t0, a0) = trace[i - 1];
+            let (t1, a1) = trace[i];
+            Some(a0 + (a1 - a0) * (t - t0) / (t1 - t0))
+        };
+        let mut worst = 0.0_f64;
+        let mut checked = 0;
+        for ev in sim.cylinder_events().since(seq0) {
+            let tdc = ev.time_s + f64::from(ev.time_to_tdc_s);
+            if let (Some(a0), Some(a1)) = (angle_at(ev.time_s), angle_at(tdc)) {
+                worst = worst.max((a1 - a0 - 180.0).abs());
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "{checked} events checked");
+        // Within 3 % of the half revolution being predicted.
+        assert!(
+            worst < 5.4,
+            "TDC prediction off by {worst:.1}° (pedal {pedal})"
+        );
+    }
 }
 
 #[test]
@@ -920,4 +999,31 @@ fn stalled_engine_in_gear_carries_no_phantom_load() {
     run(&mut sim, 2.0);
     assert!(sim.telemetry().vehicle_speed_kph < 0.2);
     assert!(sim.telemetry().rpm < 20.0);
+}
+
+#[test]
+fn sitting_on_the_rev_limiter_keeps_trouble_codes_in_the_event_log() {
+    let mut sim = warm_na(53);
+    sim.inject_fault(Fault::TimingChainStretch { retard_deg: 8.0 })
+        .unwrap();
+    run(&mut sim, 4.0);
+    assert!(sim.dtcs().contains(DtcCode::P0016));
+    sim.update_controls(|c| c.pedal = 1.0);
+    run(&mut sim, 2.0);
+    let cursor = sim.events().next_seq();
+    run(&mut sim, 5.0);
+    let warnings = sim
+        .events()
+        .since(cursor)
+        .filter(|e| matches!(e.kind, EventKind::Warning(_)))
+        .count();
+    // Limiter cycling must not re-log LeanUnderLoad / InjectorDutyHigh every cut.
+    assert!(
+        warnings <= 4,
+        "{warnings} warning events in 5 s on the limiter"
+    );
+    assert!(sim
+        .events()
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::Dtc(DtcCode::P0016))));
 }

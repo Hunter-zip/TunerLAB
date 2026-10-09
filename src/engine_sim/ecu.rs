@@ -66,18 +66,23 @@ const BARO_LEARN_STOPPED_S: f32 = 2.0;
 const BARO_WOT_LOSS_KPA: f32 = 1.0;
 /// Overboost fuel cut, once triggered, stays latched until the pedal falls below this \[%\].
 const OVERBOOST_RELEASE_PEDAL_PCT: f32 = 20.0;
-/// MAP reading at or below which the sensor is judged shorted low while running \[kPa\]
-/// (the 3-bar transfer function bottoms out at 10 kPa). Closed-throttle overrun can
-/// legitimately pull the manifold that low, so the check is suspended there.
+/// MAP reading at or below which the sensor circuit is judged shorted low while running
+/// (P0107) \[kPa\] (the 3-bar transfer function bottoms out at 10 kPa). Closed-throttle
+/// overrun can legitimately pull the manifold that low, so the check is suspended there.
 const MAP_LOW_LIMIT_KPA: f32 = 10.5;
+/// The running baro estimate only follows readings this close to it \[kPa\]: slow altitude
+/// changes are tracked, a step offset from a faulty MAP sensor is not learned.
+const BARO_TRACK_WINDOW_KPA: f32 = 5.0;
 /// IAT reading below which the circuit is judged open (the pull-up drives the input to
 /// the cold rail at −50 °C, outside the −40 °C operating range) \[°C\].
 const IAT_OPEN_LIMIT_C: f32 = -45.0;
 /// Off-idle air mass the engine must have consumed per kelvin of required warm-up before
 /// the thermostat monitor (P0128) may judge the coolant too cold \[kg/K\]. Warming the
-/// ≈ 47 kJ/K of metal, coolant and oil takes ≈ 0.05 kg of air per kelvin (≈ 0.9 MJ of
-/// coolant heat per kg of air burned); twice that is the debounce margin. The figure is
-/// for 25 °C ambient and grows with colder air (see [`Ecu::update`]).
+/// ≈ 47 kJ/K of metal, coolant and oil takes ≈ 0.05 kg of air per kelvin at part load
+/// (≈ 0.9 MJ of coolant heat per kg of air burned) and up to ≈ 0.08 kg/K at wide-open
+/// throttle, where a larger share of the fuel heat leaves with the exhaust; this bound
+/// keeps ≥ 1.4× margin over both. The figure is for 25 °C intake air and grows with
+/// colder air (see [`Ecu::update`]).
 const THERMOSTAT_MONITOR_AIR_PER_K: f64 = 0.11;
 /// Coolant temperature a healthy thermostat must reach for the P0128 monitor \[°C\].
 const THERMOSTAT_MONITOR_C: f32 = 70.0;
@@ -181,7 +186,7 @@ pub(crate) struct Ecu {
     pub rev_cut: bool,
     pub dfco: bool,
     dfco_timer: f32,
-    post_cut_hold: f32,
+    pub post_cut_hold: f32,
     boost_int: f32,
     boost_prev_err: f32,
     pub boost_target_kpa: f32,
@@ -892,17 +897,33 @@ impl Ecu {
         let rail_low = s.fuel_pressure_kpa < 0.75 * cal.injector.rated_pressure_kpa;
         self.monitor(DtcCode::P0087, rail_low, 2.0, dt, now, log);
         // Baro tracking at wide-open throttle and low speed, where MAP ≈ baro − intake loss.
-        if !turbo && s.throttle_pct > 80.0 && rpm < 2500.0 {
-            self.baro_kpa = approach(self.baro_kpa, map_kpa + BARO_WOT_LOSS_KPA, dt, 2.0);
+        // Only plausible readings close to the current estimate are followed, and never
+        // while the MAP plausibility monitor is building a case against the sensor.
+        let wot_baro = map_kpa + BARO_WOT_LOSS_KPA;
+        if !turbo
+            && s.throttle_pct > 80.0
+            && rpm < 2500.0
+            && baro_plausible
+            && (wot_baro - self.baro_kpa).abs() < BARO_TRACK_WINDOW_KPA
+            && self.dtc_timers[DtcCode::P0106.index()] == 0.0
+        {
+            self.baro_kpa = approach(self.baro_kpa, wot_baro, dt, 2.0);
         }
         let overrun = self.dfco || (pedal < 1.0 && rpm > idle_target + 300.0);
-        let map_implausible = (!turbo && map_kpa > self.baro_kpa + 15.0)
-            || (s.map_kpa <= MAP_LOW_LIMIT_KPA && !overrun);
+        let map_implausible = !turbo && map_kpa > self.baro_kpa + 15.0;
         let idle_map_high = self.idle_active && rpm > 600.0 && map_kpa > 0.85 * self.baro_kpa;
         self.monitor(
             DtcCode::P0106,
             map_implausible || idle_map_high,
             3.0,
+            dt,
+            now,
+            log,
+        );
+        self.monitor(
+            DtcCode::P0107,
+            s.map_kpa <= MAP_LOW_LIMIT_KPA && !overrun,
+            1.0,
             dt,
             now,
             log,
