@@ -1669,3 +1669,183 @@ fn stopped_engine_reports_no_indicated_torque() {
         t.instantaneous_torque_nm
     );
 }
+
+#[test]
+fn car_parked_in_gear_after_driving_is_held_by_compression() {
+    // The engine was running: key off, then parked in gear on a slope.
+    for (spec, gear, grade) in [
+        (EngineSpec::naturally_aspirated_2l(), 1, -0.15),
+        (EngineSpec::turbocharged_2l(), 1, -0.15),
+        (EngineSpec::naturally_aspirated_2l(), 2, -0.12),
+        (EngineSpec::turbocharged_2l(), 2, -0.12),
+    ] {
+        let mut sim = EngineSim::with_base_calibration(spec, 64).unwrap();
+        sim.prewarm();
+        start(&mut sim);
+        run(&mut sim, 5.0);
+        let parked = VehicleParams {
+            gear: 0,
+            clutch: 1.0,
+            brake: 1.0,
+            grade_rad: grade,
+            ..VehicleParams::default()
+        };
+        vehicle_with(&mut sim, parked, 0.0);
+        sim.update_controls(|c| c.ignition_on = false);
+        run(&mut sim, 5.0);
+        vehicle_with(&mut sim, VehicleParams { gear, ..parked }, 0.0);
+        run(&mut sim, 2.0);
+        vehicle_with(
+            &mut sim,
+            VehicleParams {
+                gear,
+                brake: 0.0,
+                ..parked
+            },
+            0.0,
+        );
+        let mut travelled = 0.0_f32;
+        let mut travelled_at_10s = 0.0_f32;
+        for i in 0..(30.0 / FRAME) as usize {
+            sim.tick(FRAME);
+            travelled += sim.telemetry().vehicle_speed_kph / 3.6 * FRAME;
+            if i == (10.0 / FRAME) as usize {
+                travelled_at_10s = travelled;
+            }
+        }
+        assert!(
+            travelled - travelled_at_10s < 1.0e-3,
+            "gear {gear}, grade {grade}: crept {} m after settling ({travelled} m in all)",
+            travelled - travelled_at_10s
+        );
+    }
+}
+
+#[test]
+fn engines_start_after_a_flood_clear() {
+    // Cranking with the pedal floored (no fuel) for 3 s, then releasing the pedal while
+    // still cranking: the decayed cranking fuel must still light the engine.
+    for spec in [
+        EngineSpec::naturally_aspirated_2l(),
+        EngineSpec::turbocharged_2l(),
+    ] {
+        let mut sim = EngineSim::with_base_calibration(spec, 7).unwrap();
+        sim.update_controls(|c| {
+            c.ignition_on = true;
+            c.starter = true;
+            c.pedal = 1.0;
+        });
+        run(&mut sim, 3.0);
+        sim.update_controls(|c| c.pedal = 0.0);
+        run(&mut sim, 3.0);
+        sim.update_controls(|c| c.starter = false);
+        run(&mut sim, 2.0);
+        assert_eq!(sim.condition(), EngineCondition::Running);
+    }
+}
+
+#[test]
+fn base_cranking_fuel_follows_the_injector_hardware() {
+    // Slow injectors (long dead time) and big injectors both get a cranking table that
+    // delivers the reference fuel mass, so the engine starts cold and hot.
+    let mut slow = EngineSpec::turbocharged_2l();
+    slow.fuel_system.injector_dead_time_s = 3.0e-3;
+    slow.fuel_system.injector_dead_time_slope_s_per_v = 1.0e-3;
+    for spec in [slow, EngineSpec::turbocharged_2l()] {
+        for ambient_c in [-20.0, 20.0, 40.0] {
+            let mut sim = EngineSim::with_base_calibration(spec, 7).unwrap();
+            sim.update_controls(|c| c.ambient.temperature_k = 273.15 + ambient_c);
+            sim.soak_to_ambient();
+            start(&mut sim);
+            run(&mut sim, 2.0);
+            assert_eq!(
+                sim.condition(),
+                EngineCondition::Running,
+                "no start at {ambient_c} °C"
+            );
+        }
+    }
+}
+
+#[test]
+fn dead_injector_reads_lean_not_rich() {
+    // A fully clogged injector starves its cylinder: lean under load, and closed loop
+    // over-fuelling the others must not be reported as a rich mixture.
+    let mut sim = warm_na(71);
+    run(&mut sim, 20.0);
+    sim.inject_fault(Fault::InjectorClogged {
+        cylinder: 1,
+        flow_fraction: 0.0,
+    })
+    .unwrap();
+    dyno(&mut sim, 3000.0, 0.95);
+    let mut lean = 0;
+    for _ in 0..(10.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        if sim.telemetry().warnings.contains(Warning::LeanUnderLoad) {
+            lean += 1;
+        }
+    }
+    assert!(lean > 400, "lean in {lean} of 600 frames");
+    let mut sim = warm_na(72);
+    run(&mut sim, 20.0);
+    sim.inject_fault(Fault::InjectorClogged {
+        cylinder: 2,
+        flow_fraction: 0.0,
+    })
+    .unwrap();
+    dyno(&mut sim, 2500.0, 0.25);
+    let mut rich = 0;
+    for _ in 0..(60.0 / FRAME) as usize {
+        sim.tick(FRAME);
+        if sim.telemetry().warnings.contains(Warning::RichMixture) {
+            rich += 1;
+        }
+    }
+    assert_eq!(rich, 0, "rich in {rich} frames");
+}
+
+#[test]
+fn creep_returns_to_target_after_a_disturbance() {
+    let mut sim = warm_na(101);
+    drive_away(&mut sim);
+    vehicle(&mut sim, 1, 1.0, 0.0);
+    run(&mut sim, 30.0);
+    // A short rise lugs the engine below target and calls in the anti-stall air.
+    vehicle_with(
+        &mut sim,
+        VehicleParams {
+            gear: 1,
+            clutch: 1.0,
+            grade_rad: 0.03,
+            ..VehicleParams::default()
+        },
+        0.0,
+    );
+    run(&mut sim, 4.0);
+    vehicle(&mut sim, 1, 1.0, 0.0);
+    run(&mut sim, 20.0);
+    let rpm = average(&mut sim, 10.0, |t| t.rpm);
+    assert!((750.0..870.0).contains(&rpm), "creep at {rpm} rpm");
+}
+
+#[test]
+fn healthy_turbo_shows_no_rich_mixture_through_fuel_cuts() {
+    // On the rev limiter the fuelled-cycle λ freezes at its last pre-cut value during each
+    // cut; the mixture warnings must stay quiet while nothing burns.
+    let mut sim = warm_turbo(21);
+    dyno(&mut sim, 9000.0, 1.0);
+    run(&mut sim, 3.0);
+    let mut rich = 0;
+    let frames = (20.0 / FRAME) as usize;
+    for _ in 0..frames {
+        sim.tick(FRAME);
+        if sim.telemetry().warnings.contains(Warning::RichMixture) {
+            rich += 1;
+        }
+    }
+    assert!(
+        rich * 50 < frames,
+        "rich in {rich} of {frames} frames on the limiter"
+    );
+}

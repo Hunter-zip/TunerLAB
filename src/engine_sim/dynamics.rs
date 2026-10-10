@@ -110,9 +110,10 @@ pub(crate) struct CrankInputs {
     pub seized: bool,
 }
 
-/// Advances crank and load by one step. Returns `true` when the crank is at rest and the
-/// net torque on it exceeds static friction backwards: the crank would rock back, which
-/// this one-directional model represents by releasing what pushes it (see the plant).
+/// Advances crank and load by one step. Returns `true` when the crank is at rest against
+/// a static load and the net torque on it exceeds static friction backwards: the crank
+/// would rock back, which this one-directional model represents by releasing what pushes
+/// it (see the plant).
 pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt: f32) -> bool {
     let omega = st.omega;
     if !matches!(load, LoadModel::Dyno(_)) {
@@ -269,7 +270,15 @@ pub(crate) fn step(st: &mut CrankState, inp: &CrankInputs, load: &LoadModel, dt:
         st.driveline_spring_nm = approach(spring, 0.0, dt, DRIVELINE_RELAX_TAU_S);
     }
     st.theta = wrap_cycle(st.theta + st.omega * dt);
-    pushed_back
+    // Only against a static load is the backward push the crank's own trapped charge:
+    // while the car still rolls (or the absorber rotor still turns) the driveline spring
+    // is winding up and will push the crank forward within milliseconds.
+    let load_static = match load {
+        LoadModel::Neutral => true,
+        LoadModel::Dyno(_) => st.dyno_omega <= 0.0,
+        LoadModel::Vehicle(v) => v.gear == 0 || v.clutch <= 0.0 || st.vehicle_speed <= 0.0,
+    };
+    pushed_back && load_static
 }
 
 #[cfg(test)]

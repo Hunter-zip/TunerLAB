@@ -28,6 +28,9 @@ const CRANKING_REF_PULSE_MS: [f32; COOLANT_POINTS] =
 const CRANKING_REF_CYLINDER_M3: f32 = 0.5e-3;
 /// Injector static flow of the reference engine \[g/s\].
 const CRANKING_REF_INJECTOR_G_S: f32 = 3.2;
+/// Injector dead time of the reference engine at the 10 V cranking voltage
+/// (0.9 ms + 0.25 ms/V × 4 V) \[ms\].
+const CRANKING_REF_DEAD_MS: f32 = 1.9;
 
 /// Errors from [`Calibration::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,14 +565,14 @@ impl Calibration {
 
         // Cranking fuel, characterised as pulse widths on the reference 2.0 L engine
         // (0.5 L cylinders, 3.2 g/s injectors) and rescaled as fuel mass to this engine's
-        // cylinder size and injector flow, the dead time at the cranking battery voltage
-        // (10 V) kept: t = t_dead + (t_ref − t_dead)·(V_cyl/V_ref)·(q_ref/q).
+        // cylinder size and injector flow at the cranking battery voltage (10 V):
+        // t = t_dead + (t_ref − t_dead,ref)·(V_cyl/V_ref)·(q_ref/q).
         let crank_scale = (v_cyl / CRANKING_REF_CYLINDER_M3)
             * (CRANKING_REF_INJECTOR_G_S / injector_flow_g_s.max(1.0e-3));
         let dead_cranking_ms = dead_values[1];
         let mut cranking_values = [0.0; COOLANT_POINTS];
         for (v, &t_ref) in cranking_values.iter_mut().zip(CRANKING_REF_PULSE_MS.iter()) {
-            let pulse = dead_cranking_ms + (t_ref - dead_cranking_ms).max(0.0) * crank_scale;
+            let pulse = dead_cranking_ms + (t_ref - CRANKING_REF_DEAD_MS).max(0.0) * crank_scale;
             *v = round_to(pulse, 0.1).clamp(0.0, 100.0);
         }
 

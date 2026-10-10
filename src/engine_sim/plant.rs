@@ -160,8 +160,8 @@ pub(crate) struct Plant {
     pub t_fresh: f32,
     pub valve_float: f32,
     pub exhaust_lambda: f32,
-    /// Exhaust λ mixed over injected cycles only: the mixture the engine burns, without the
-    /// air of commanded fuel cuts.
+    /// Exhaust λ mixed over cycles the ECU fuelled only: the mixture the engine burns,
+    /// without the air of commanded fuel cuts (a failed injector still counts).
     pub exhaust_lambda_fuelled: f32,
     pub exhaust_lambda_apparent: f32,
     pub exhaust_port_temp: f32,
@@ -950,7 +950,9 @@ impl Plant {
         let n = self.cylinders as f32;
         let lam = r.lambda.min(3.0);
         self.exhaust_lambda += (lam - self.exhaust_lambda) / n;
-        if m_inj > 0.0 {
+        // Fuelled = fuel commanded by the ECU (commanded cuts excluded), whatever the
+        // injector actually delivers: a dead injector is a lean cylinder, not a fuel cut.
+        if cmd.injector_pw_s[c] > 0.0 {
             self.exhaust_lambda_fuelled += (lam - self.exhaust_lambda_fuelled) / n;
         }
         // The wide-band sensor's catalytic electrode oxidises exhaust hydrocarbons, so it

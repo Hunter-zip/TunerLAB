@@ -563,8 +563,8 @@ impl EngineSpec {
         spec.intake.manifold_volume_m3 = 0.0030;
         // Larger air filter for the higher flow.
         spec.intake.filter_restriction = 50_000.0;
-        // 6.5 g/s ≈ 530 cm³/min at 3 bar: ≈ 80 % duty at the rich (λ ≈ 0.72) full-boost
-        // redline, the usual OEM sizing margin.
+        // 6.5 g/s ≈ 530 cm³/min at 3 bar: ≈ 65 % duty at the rich (λ ≈ 0.72) full-boost
+        // redline (≈ 15.8 g/s), leaving headroom for raised boost.
         spec.fuel_system.injector_flow_kg_s = 6.5e-3;
         // ≈ 1.9× the 15 g/s full-boost demand.
         spec.fuel_system.pump_capacity_kg_s = 0.028;

@@ -84,6 +84,9 @@ const IDLE_GEAR_LIMIT: f32 = 0.3;
 const IDLE_GEAR_BLEED_TAU_S: f32 = 1.0;
 /// Largest closing trim of the in-gear idle term while creeping \[duty\].
 const IDLE_GEAR_TRIM_DOWN: f32 = 0.05;
+/// In-gear anti-stall air below which the creep trim takes over from the bleed-off
+/// \[duty\]: the asymptotic bleed would otherwise take ≈ 60 s to reach exactly zero.
+const IDLE_GEAR_HANDOVER: f32 = 1.0e-3;
 /// Vehicle speed below which in-gear idle may close the valve: creeping, with the engine
 /// driving the car, not coasting, where the wheels hold the engine speed \[km/h\].
 const IDLE_GEAR_CREEP_KPH: f32 = 15.0;
@@ -186,12 +189,15 @@ pub(crate) struct Ecu {
     rpm_rate: f32,
     /// Time the crank has been at rest, key-off time included \[s\].
     stopped_time: f32,
-    /// In-gear anti-stall idle air \[duty\]: only opens, discarded when the driveline opens.
+    /// In-gear idle-air term \[duty\]: opens up to [`IDLE_GEAR_LIMIT`] when lugged, closes
+    /// by up to [`IDLE_GEAR_TRIM_DOWN`] while creeping, otherwise bleeds to zero (also after
+    /// the driveline opens).
     idle_int_gear: f32,
     /// Slow copies of the MAP and BARO readings (see [`PRESSURE_SETTLE_TAU_S`]) \[kPa\].
     map_slow_kpa: f32,
     baro_slow_kpa: f32,
-    /// Remaining time during which the exhaust still carries fuel-cut gas \[s\].
+    /// Remaining film-rebuild window after a fuel cut (see [`CUT_FLUSH_CYCLES`]) during
+    /// which the mixture and injector-duty warnings stay quiet \[s\].
     pub cut_flush_hold: f32,
     /// Idle-valve position the stepper is parked at when the key goes off.
     parked_idle_valve: f32,
@@ -595,14 +601,16 @@ impl Ecu {
             EcuMode::Cranking => {
                 // Cranking fuel decays with cranking time so a long crank does not flood the
                 // engine; pedal held to the floor is the classic "flood clear" (no fuel).
+                // Only the injector's open time decays; its dead time delivers nothing.
                 let decay = 0.4 + 0.6 * (-self.crank_time / cal.cranking_decay_s.max(0.1)).exp();
                 let flood_clear = s.pedal_pct > 90.0;
+                let dead = cal.injector.dead_time_ms.lookup(s.battery_v) * 1.0e-3;
                 let pw = if flood_clear {
                     0.0
                 } else {
-                    cal.cranking_pulse_ms.lookup(ect).max(0.0) * 1.0e-3 * decay
+                    let table = cal.cranking_pulse_ms.lookup(ect).max(0.0) * 1.0e-3;
+                    dead.min(table) + (table - dead).max(0.0) * decay
                 };
-                let dead = cal.injector.dead_time_ms.lookup(s.battery_v) * 1.0e-3;
                 let flow = cal.injector.flow_g_s * 1.0e-3;
                 for c in 0..n {
                     cmd.injector_pw_s[c] = pw;
@@ -775,7 +783,7 @@ impl Ecu {
             && self.idle_active
             && creeping
             && idle_err > -IDLE_INTEGRATION_BAND_RPM
-            && self.idle_int_gear <= 0.0
+            && self.idle_int_gear <= IDLE_GEAR_HANDOVER
         {
             self.idle_int_gear =
                 (self.idle_int_gear + ic.ki * idle_err * dt).max(-IDLE_GEAR_TRIM_DOWN);

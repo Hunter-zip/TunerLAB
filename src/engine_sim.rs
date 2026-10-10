@@ -407,7 +407,7 @@ impl EngineSim {
         );
         w.set(
             Warning::RichMixture,
-            running && p.exhaust_lambda_fuelled < 0.7,
+            running && !fuel_cut && p.exhaust_lambda_fuelled < 0.7,
         );
         // Turbine wheels set the EGT ceiling on turbo engines, exhaust valves and the
         // catalyst on naturally aspirated ones.
