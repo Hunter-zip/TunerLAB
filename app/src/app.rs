@@ -12,7 +12,7 @@ use tunerlab_core::{
 
 use crate::autopsy::{self, Autopsy, Verdict};
 use crate::dyno::DynoBench;
-use crate::history::{History, SAMPLES};
+use crate::history::{History, Readout, SAMPLES};
 use crate::maps::MapEditor;
 use crate::text::{tr, T};
 use crate::widgets::{self, palette::*, Gauge, Level, Series};
@@ -103,6 +103,8 @@ pub struct TunerApp {
     preset: Preset,
     sim: EngineSim,
     tab: Tab,
+    /// Dashboard shows physical truth instead of the ECU's sensor readings.
+    truth_view: bool,
     speed: f32,
     paused: bool,
     last_frame: Option<Instant>,
@@ -129,6 +131,7 @@ impl TunerApp {
             preset,
             sim,
             tab: Tab::Dashboard,
+            truth_view: false,
             speed: 1.0,
             paused: false,
             last_frame: None,
@@ -254,6 +257,20 @@ impl TunerApp {
         });
     }
 
+    /// Whether the dashboard shows physical truth: never while an Engine Autopsy case is
+    /// open, where it would give the answer away.
+    fn showing_truth(&self) -> bool {
+        self.truth_view && self.autopsy.fault.is_none()
+    }
+
+    fn readout(&self) -> Readout {
+        Readout::new(
+            self.sim.telemetry(),
+            self.showing_truth(),
+            self.inputs.baro_kpa,
+        )
+    }
+
     fn poll_events(&mut self) {
         let log = self.sim.events();
         for ev in log.since(self.event_cursor) {
@@ -300,7 +317,8 @@ impl eframe::App for TunerApp {
         if !self.paused {
             self.sim.tick(dt * self.speed);
         }
-        self.history.record(self.sim.telemetry());
+        let readout = self.readout();
+        self.history.record(self.sim.telemetry(), &readout);
         self.poll_events();
         self.dyno.poll();
         ctx.request_repaint();
@@ -367,6 +385,24 @@ impl TunerApp {
                     {
                         self.tab = tab;
                     }
+                }
+                ui.separator();
+                ui.label(RichText::new(tr(T::View, lang)).color(DIM));
+                if ui
+                    .selectable_label(!self.showing_truth(), tr(T::ViewEcu, lang))
+                    .clicked()
+                {
+                    self.truth_view = false;
+                }
+                let locked = self.autopsy.fault.is_some();
+                let truth = ui
+                    .add_enabled(
+                        !locked,
+                        egui::Button::selectable(self.showing_truth(), tr(T::ViewTruth, lang)),
+                    )
+                    .on_disabled_hover_text(tr(T::ViewLocked, lang));
+                if truth.clicked() {
+                    self.truth_view = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     for l in [Language::En, Language::Pl] {
@@ -589,6 +625,8 @@ impl TunerApp {
         let turbo = spec.turbo.is_some();
         let redline = spec.limits.redline_rpm;
         let running = t.rpm > 1.0;
+        let truth = self.showing_truth();
+        let r = self.readout();
         let avail = ui.available_width();
         let big = (avail * 0.30).clamp(200.0, 300.0);
         let small = (avail * 0.15).clamp(120.0, 170.0);
@@ -598,7 +636,7 @@ impl TunerApp {
             widgets::round_gauge(
                 ui,
                 big,
-                &Gauge::new(tr(T::Rpm, lang), "×1000", 0.0, rpm_max, t.rpm)
+                &Gauge::new(tr(T::Rpm, lang), "×1000", 0.0, rpm_max, r.rpm)
                     .step(1000.0)
                     .divisor(1000.0)
                     .danger(redline, rpm_max),
@@ -606,19 +644,18 @@ impl TunerApp {
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     let map_max = if turbo { 250.0 } else { 110.0 };
-                    let mut g = Gauge::new(
-                        tr(T::Manifold, lang),
-                        "kPa",
-                        0.0,
-                        map_max,
-                        t.manifold_pressure_kpa,
-                    )
-                    .step(if turbo { 50.0 } else { 20.0 });
+                    let mut g = Gauge::new(tr(T::Manifold, lang), "kPa", 0.0, map_max, r.map_kpa)
+                        .step(if turbo { 50.0 } else { 20.0 });
                     if turbo && t.boost_target_kpa > 0.0 {
                         g = g.marker(t.boost_target_kpa, CYAN);
                     }
                     widgets::round_gauge(ui, small, &g);
-                    let lambda = if running { t.lambda.min(1.6) } else { f32::NAN };
+                    // `f32::min` would turn a missing reading (NaN) into the cap.
+                    let lambda = if r.lambda.is_finite() {
+                        r.lambda.min(1.6)
+                    } else {
+                        f32::NAN
+                    };
                     let mut g = Gauge::new(tr(T::Lambda, lang), "λ", 0.6, 1.4, lambda)
                         .decimals(2)
                         .step(0.1)
@@ -631,7 +668,7 @@ impl TunerApp {
                     widgets::round_gauge(
                         ui,
                         small,
-                        &Gauge::new(tr(T::Coolant, lang), "°C", 0.0, 140.0, t.coolant_temp_c)
+                        &Gauge::new(tr(T::Coolant, lang), "°C", 0.0, 140.0, r.coolant_c)
                             .step(20.0)
                             .caution(105.0, 115.0)
                             .danger(115.0, 140.0),
@@ -641,7 +678,7 @@ impl TunerApp {
                     widgets::round_gauge(
                         ui,
                         small,
-                        &Gauge::new(tr(T::OilTemp, lang), "°C", 0.0, 160.0, t.oil_temp_c)
+                        &Gauge::new(tr(T::OilTemp, lang), "°C", 0.0, 160.0, r.oil_temp_c)
                             .step(20.0)
                             .caution(125.0, 135.0)
                             .danger(135.0, 160.0),
@@ -649,15 +686,9 @@ impl TunerApp {
                     widgets::round_gauge(
                         ui,
                         small,
-                        &Gauge::new(
-                            tr(T::OilPressure, lang),
-                            "bar",
-                            0.0,
-                            7.0,
-                            t.oil_pressure_kpa / 100.0,
-                        )
-                        .decimals(1)
-                        .step(1.0),
+                        &Gauge::new(tr(T::OilPressure, lang), "bar", 0.0, 7.0, r.oil_kpa / 100.0)
+                            .decimals(1)
+                            .step(1.0),
                     );
                     if turbo {
                         widgets::round_gauge(
@@ -668,7 +699,7 @@ impl TunerApp {
                                 "krpm",
                                 0.0,
                                 220.0,
-                                t.turbo_rpm / 1000.0,
+                                r.turbo_rpm / 1000.0,
                             )
                             .step(40.0)
                             .danger(190.0, 220.0),
@@ -677,14 +708,8 @@ impl TunerApp {
                         widgets::round_gauge(
                             ui,
                             small,
-                            &Gauge::new(
-                                tr(T::VehicleSpeed, lang),
-                                "km/h",
-                                0.0,
-                                240.0,
-                                t.vehicle_speed_kph,
-                            )
-                            .step(40.0),
+                            &Gauge::new(tr(T::VehicleSpeed, lang), "km/h", 0.0, 240.0, r.speed_kph)
+                                .step(40.0),
                         );
                     }
                 });
@@ -733,7 +758,11 @@ impl TunerApp {
                 tile,
                 tr(T::Ignition2, lang),
                 &live(format!("{:.1}", t.ignition_advance_deg)),
-                &format!("° / {} {:.0}°", tr(T::Mbt, lang), t.mbt_advance_deg),
+                &if truth {
+                    format!("° / {} {:.0}°", tr(T::Mbt, lang), t.mbt_advance_deg)
+                } else {
+                    "°".to_owned()
+                },
                 lvl(false, false),
             );
             widgets::tile(
@@ -767,31 +796,41 @@ impl TunerApp {
                 ui,
                 tile,
                 tr(T::IntakeAir, lang),
-                &format!("{:.0}", t.intake_air_temp_c),
+                &format!("{:.0}", r.iat_c),
                 "°C",
-                lvl(t.intake_air_temp_c > 70.0, t.intake_air_temp_c > 55.0),
+                lvl(r.iat_c > 70.0, r.iat_c > 55.0),
             );
             widgets::tile(
                 ui,
                 tile,
                 tr(T::Egt, lang),
-                &format!("{:.0}", t.egt_c),
+                &format!("{:.0}", r.egt_c),
                 "°C",
-                lvl(t.egt_c > 950.0, t.egt_c > 880.0),
+                lvl(r.egt_c > 950.0, r.egt_c > 880.0),
             );
+            if truth && turbo {
+                widgets::tile(
+                    ui,
+                    tile,
+                    tr(T::Boost, lang),
+                    &format!("{:.0}", t.boost_pressure_kpa),
+                    "kPa",
+                    lvl(false, false),
+                );
+            }
             widgets::tile(
                 ui,
                 tile,
-                tr(T::Boost, lang),
-                &format!("{:.0}", t.boost_pressure_kpa),
+                tr(T::Baro, lang),
+                &format!("{:.1}", r.baro_kpa),
                 "kPa",
-                lvl(false, false),
+                Level::Normal,
             );
             widgets::tile(
                 ui,
                 tile,
                 tr(T::FuelPressure, lang),
-                &format!("{:.0}", t.fuel_pressure_kpa),
+                &format!("{:.0}", r.fuel_kpa),
                 "kPa",
                 Level::Normal,
             );
@@ -799,9 +838,9 @@ impl TunerApp {
                 ui,
                 tile,
                 tr(T::Battery, lang),
-                &format!("{:.1}", t.battery_v),
+                &format!("{:.1}", r.battery_v),
                 "V",
-                if t.battery_v < 11.8 {
+                if r.battery_v < 11.8 {
                     Level::Caution
                 } else {
                     Level::Normal
@@ -811,11 +850,75 @@ impl TunerApp {
                 ui,
                 tile,
                 tr(T::VehicleSpeed, lang),
-                &format!("{:.0}", t.vehicle_speed_kph),
+                &format!("{:.0}", r.speed_kph),
                 "km/h",
                 Level::Normal,
             );
         });
+
+        // Per-cylinder data: the ECU's knock retard, knock-sensor window and misfire
+        // counters; peak pressure and piston temperature only in the instructor view.
+        ui.add_space(6.0);
+        let n = t.cylinders.max(1);
+        egui::Grid::new("cylinders")
+            .striped(true)
+            .min_col_width(64.0)
+            .show(ui, |ui| {
+                ui.label(RichText::new(tr(T::Cylinders, lang)).strong());
+                for c in 0..n {
+                    ui.label(
+                        RichText::new(format!("{} {}", tr(T::Cylinder, lang), c + 1)).color(DIM),
+                    );
+                }
+                ui.end_row();
+                let row =
+                    |ui: &mut egui::Ui,
+                     label: &str,
+                     values: &mut dyn Iterator<Item = (String, Color32)>| {
+                        ui.label(RichText::new(label).color(DIM));
+                        for (v, color) in values {
+                            ui.label(RichText::new(v).monospace().color(color));
+                        }
+                        ui.end_row();
+                    };
+                row(
+                    ui,
+                    tr(T::KnockRetard, lang),
+                    &mut t.knock_retard_deg[..n]
+                        .iter()
+                        .map(|v| (format!("{v:.1}°"), if *v > 0.5 { WARN } else { TEXT })),
+                );
+                row(
+                    ui,
+                    tr(T::Misfires, lang),
+                    &mut t.misfire_count[..n]
+                        .iter()
+                        .map(|v| (v.to_string(), if *v > 0 { WARN } else { TEXT })),
+                );
+                if truth {
+                    row(
+                        ui,
+                        tr(T::KnockLevel, lang),
+                        &mut t.knock_intensity[..n]
+                            .iter()
+                            .map(|v| (format!("{v:.2}"), if *v > 0.5 { DANGER } else { TEXT })),
+                    );
+                    row(
+                        ui,
+                        tr(T::PeakPressure, lang),
+                        &mut t.peak_pressure_bar[..n]
+                            .iter()
+                            .map(|v| (format!("{v:.0}"), TEXT)),
+                    );
+                    row(
+                        ui,
+                        tr(T::PistonTemp, lang),
+                        &mut t.piston_temp_c[..n]
+                            .iter()
+                            .map(|v| (format!("{v:.0}"), if *v > 300.0 { WARN } else { TEXT })),
+                    );
+                }
+            });
 
         // Charts.
         ui.add_space(6.0);
