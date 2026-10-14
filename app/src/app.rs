@@ -5,14 +5,15 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, Key, RichText, Vec2};
 use tunerlab_core::engine_sim::events::{DiagnosticEvent, EventKind};
+use tunerlab_core::engine_sim::MAX_TICK_S;
 use tunerlab_core::{
-    DynoParams, EngineCondition, EngineSim, EngineSpec, Language, LoadModel, Localize,
-    VehicleParams, Warning,
+    DynoParams, EngineCondition, EngineSim, EngineSpec, FailureCause, Language, LoadModel,
+    Localize, VehicleParams, Warning,
 };
 
 use crate::autopsy::{self, Autopsy, Verdict};
 use crate::dyno::DynoBench;
-use crate::history::{History, Readout, SAMPLES};
+use crate::history::{self, History, Readout, SAMPLES};
 use crate::maps::MapEditor;
 use crate::text::{tr, T};
 use crate::widgets::{self, palette::*, Gauge, Level, Series};
@@ -95,6 +96,8 @@ impl Default for DriverInputs {
 const SEED: u64 = 2026;
 /// Diagnostic events kept for the log.
 const EVENT_HISTORY: usize = 300;
+/// Width the top bar keeps free for the clock, speed and language buttons \[px\].
+const SIM_CONTROLS_W: f32 = 360.0;
 /// Longest wall-clock step fed to the simulation (a stalled window must not jump) \[s\].
 const MAX_FRAME_S: f32 = 0.1;
 
@@ -111,6 +114,8 @@ pub struct TunerApp {
     inputs: DriverInputs,
     /// Starter button held with the mouse this frame.
     starter_button: bool,
+    /// Keys held this frame (the panel shows the inputs they override).
+    held: KeyState,
     history: History,
     events: VecDeque<DiagnosticEvent>,
     event_cursor: u64,
@@ -137,6 +142,7 @@ impl TunerApp {
             last_frame: None,
             inputs: DriverInputs::default(),
             starter_button: false,
+            held: KeyState::default(),
             history: History::default(),
             events: VecDeque::new(),
             event_cursor,
@@ -153,22 +159,54 @@ impl TunerApp {
         if let Ok(sim) = EngineSim::with_base_calibration(preset.spec(), SEED) {
             self.preset = preset;
             self.sim = sim;
-            self.event_cursor = self.sim.events().next_seq();
-            self.events.clear();
+            // The new engine starts at the ambient set in the panel, not the default 25 °C.
+            let (ambient_k, baro_pa) = (
+                self.inputs.ambient_c + 273.15,
+                self.inputs.baro_kpa * 1000.0,
+            );
+            self.sim.update_controls(|c| {
+                c.ambient.temperature_k = ambient_k;
+                c.ambient.pressure_pa = baro_pa;
+            });
+            self.sim.soak_to_ambient();
+            self.clear_log();
             self.history.clear();
             self.autopsy.close();
+            self.maps = MapEditor::default();
+            self.dyno = DynoBench::default();
             self.inputs.ignition = false;
             self.inputs.pedal_pct = 0.0;
         }
     }
 
+    /// Empties the event log (new engine, reset, new Engine Autopsy case).
+    fn clear_log(&mut self) {
+        self.events.clear();
+        self.event_cursor = self.sim.events().next_seq();
+    }
+
     /// Writes the driver inputs (panel state plus held keys) into the simulation.
     fn apply_controls(&mut self, ctx: &egui::Context) {
-        let typing = ctx.egui_wants_keyboard_input();
+        // Shortcuts are off only while a text field has the keyboard; any other focused
+        // widget gives focus back, so Space (brake) never clicks a focused button.
+        let typing = ctx.text_edit_focused();
+        if !typing {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         let keys = ctx.input(|i| {
             if typing {
                 return KeyState::default();
             }
+            // Toggles react to the first press only, not to keyboard auto-repeat.
+            let pressed_once = |key: Key| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { key: k, pressed: true, repeat: false, .. } if *k == key)
+                })
+            };
             let mut gear = None;
             for (k, g) in [
                 (Key::Num0, 0u8),
@@ -179,12 +217,12 @@ impl TunerApp {
                 (Key::Num5, 5),
                 (Key::Num6, 6),
             ] {
-                if i.key_pressed(k) {
+                if pressed_once(k) {
                     gear = Some(g);
                 }
             }
             KeyState {
-                ignition_toggle: i.key_pressed(Key::K),
+                ignition_toggle: pressed_once(Key::K),
                 starter: i.key_down(Key::S),
                 full_throttle: i.key_down(Key::W),
                 pedal_up: i.key_pressed(Key::ArrowUp),
@@ -194,6 +232,7 @@ impl TunerApp {
                 gear,
             }
         });
+        self.held = keys;
         let inp = &mut self.inputs;
         if keys.ignition_toggle {
             inp.ignition = !inp.ignition;
@@ -283,7 +322,7 @@ impl TunerApp {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct KeyState {
     ignition_toggle: bool,
     starter: bool,
@@ -315,7 +354,13 @@ impl eframe::App for TunerApp {
         self.last_frame = Some(now);
         self.apply_controls(ctx);
         if !self.paused {
-            self.sim.tick(dt * self.speed);
+            // The core truncates single ticks above MAX_TICK_S; split fast-forward frames.
+            let mut remaining = dt * self.speed;
+            while remaining > 0.0 {
+                let step = remaining.min(MAX_TICK_S);
+                self.sim.tick(step);
+                remaining -= step;
+            }
         }
         let readout = self.readout();
         self.history.record(self.sim.telemetry(), &readout);
@@ -338,14 +383,29 @@ impl eframe::App for TunerApp {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| self.status_panel(ui));
             });
+        // Tabs scroll when the window is smaller than their content (minimum 1200×720).
         egui::CentralPanel::default_margins().show(ui, |ui| match self.tab {
-            Tab::Dashboard => self.dashboard(ui),
+            Tab::Dashboard => {
+                egui::ScrollArea::vertical()
+                    .id_salt("dashboard")
+                    .show(ui, |ui| self.dashboard(ui));
+            }
             Tab::Maps => {
                 let lang = self.lang;
-                self.maps.show(ui, &mut self.sim, lang);
+                egui::ScrollArea::both()
+                    .id_salt("maps")
+                    .show(ui, |ui| self.maps.show(ui, &mut self.sim, lang));
             }
-            Tab::Dyno => self.dyno_tab(ui),
-            Tab::Autopsy => self.autopsy_tab(ui),
+            Tab::Dyno => {
+                egui::ScrollArea::vertical()
+                    .id_salt("dyno")
+                    .show(ui, |ui| self.dyno_tab(ui));
+            }
+            Tab::Autopsy => {
+                egui::ScrollArea::vertical()
+                    .id_salt("autopsy")
+                    .show(ui, |ui| self.autopsy_tab(ui));
+            }
             Tab::Log => self.log_tab(ui),
         });
     }
@@ -355,6 +415,7 @@ impl TunerApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
         egui::Panel::top("top").show(ui, |ui| {
+            let mut narrow = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("TunerLAB").strong().size(20.0).color(ACCENT));
                 ui.separator();
@@ -404,37 +465,51 @@ impl TunerApp {
                 if truth.clicked() {
                     self.truth_view = true;
                 }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for l in [Language::En, Language::Pl] {
-                        if ui.selectable_label(self.lang == l, l.code()).clicked() {
-                            self.lang = l;
-                        }
-                    }
-                    ui.separator();
-                    for s in [5.0_f32, 2.0, 1.0] {
-                        if ui
-                            .selectable_label(!self.paused && self.speed == s, format!("{s:.0}×"))
-                            .clicked()
-                        {
-                            self.speed = s;
-                            self.paused = false;
-                        }
-                    }
-                    if ui
-                        .selectable_label(self.paused, tr(T::Pause, lang))
-                        .clicked()
-                    {
-                        self.paused = !self.paused;
-                    }
-                    ui.label(RichText::new(tr(T::SimSpeed, lang)).color(DIM));
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("{:.1} s", self.sim.time_s()))
-                            .monospace()
-                            .color(DIM),
-                    );
-                });
+                if ui.available_width() >= SIM_CONTROLS_W {
+                    self.sim_controls(ui);
+                } else {
+                    narrow = true;
+                }
             });
+            // Narrow window: the simulation controls get a row of their own.
+            if narrow {
+                ui.horizontal(|ui| self.sim_controls(ui));
+            }
+        });
+    }
+
+    /// Clock, simulation speed, pause and language, right-aligned.
+    fn sim_controls(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            for l in [Language::En, Language::Pl] {
+                if ui.selectable_label(self.lang == l, l.code()).clicked() {
+                    self.lang = l;
+                }
+            }
+            ui.separator();
+            for s in [5.0_f32, 2.0, 1.0] {
+                if ui
+                    .selectable_label(!self.paused && self.speed == s, format!("{s:.0}×"))
+                    .clicked()
+                {
+                    self.speed = s;
+                    self.paused = false;
+                }
+            }
+            if ui
+                .selectable_label(self.paused, tr(T::Pause, lang))
+                .clicked()
+            {
+                self.paused = !self.paused;
+            }
+            ui.label(RichText::new(tr(T::SimSpeed, lang)).color(DIM));
+            ui.separator();
+            ui.label(
+                RichText::new(format!("{:.1} s", self.sim.time_s()))
+                    .monospace()
+                    .color(DIM),
+            );
         });
     }
 
@@ -449,14 +524,19 @@ impl TunerApp {
         );
         let starter = ui.add_enabled(
             inp.ignition,
+            // Drag sensing keeps the button pressed for as long as it is held (a plain
+            // click button gives up after egui's 0.8 s click timeout).
             egui::Button::new(RichText::new(tr(T::Starter, lang)).strong())
-                .min_size(Vec2::new(250.0, 34.0)),
+                .min_size(Vec2::new(250.0, 34.0))
+                .sense(egui::Sense::click_and_drag()),
         );
         self.starter_button = starter.is_pointer_button_down_on();
+        let held = self.held;
+        let rpm = self.sim.telemetry().rpm;
         let inp = &mut self.inputs;
         ui.add_space(6.0);
         ui.label(tr(T::Pedal, lang));
-        ui.add(egui::Slider::new(&mut inp.pedal_pct, 0.0..=100.0).suffix(" %"));
+        held_slider(ui, &mut inp.pedal_pct, held.full_throttle.then_some(100.0));
 
         ui.add_space(8.0);
         ui.label(RichText::new(tr(T::LoadModel, lang)).strong());
@@ -472,7 +552,7 @@ impl TunerApp {
                 ui.add(
                     egui::Slider::new(&mut inp.dyno_rpm, 800.0..=8000.0)
                         .step_by(50.0)
-                        .suffix(" rpm"),
+                        .suffix(format!(" {}", tr(T::AxisRpm, lang))),
                 );
             }
             LoadKind::Vehicle => {
@@ -492,9 +572,9 @@ impl TunerApp {
                     }
                 });
                 ui.label(tr(T::Clutch, lang));
-                ui.add(egui::Slider::new(&mut inp.clutch_pct, 0.0..=100.0).suffix(" %"));
+                held_slider(ui, &mut inp.clutch_pct, held.clutch.then_some(0.0));
                 ui.label(tr(T::Brake, lang));
-                ui.add(egui::Slider::new(&mut inp.brake_pct, 0.0..=100.0).suffix(" %"));
+                held_slider(ui, &mut inp.brake_pct, held.brake.then_some(100.0));
                 ui.label(tr(T::Grade, lang));
                 ui.add(egui::Slider::new(&mut inp.grade_pct, -15.0..=15.0).suffix(" %"));
             }
@@ -525,7 +605,12 @@ impl TunerApp {
             if ui.button(tr(T::Prewarm, lang)).clicked() {
                 self.sim.prewarm();
             }
-            if ui.button(tr(T::Soak, lang)).clicked() {
+            // The core only soaks a stopped engine.
+            if ui
+                .add_enabled(rpm <= 0.0, egui::Button::new(tr(T::Soak, lang)))
+                .on_disabled_hover_text(tr(T::SoakNeedsStop, lang))
+                .clicked()
+            {
                 self.sim.soak_to_ambient();
             }
             if ui.button(tr(T::Repair, lang)).clicked() {
@@ -537,6 +622,7 @@ impl TunerApp {
                 self.inputs.pedal_pct = 0.0;
                 self.history.clear();
                 self.autopsy.close();
+                self.clear_log();
             }
         });
         ui.add_space(8.0);
@@ -605,17 +691,69 @@ impl TunerApp {
         let w = ui.available_width().min(300.0);
         let min = |a: &[f32]| a[..n].iter().copied().fold(1.0_f32, f32::min);
         let max = |a: &[f32]| a[..n].iter().copied().fold(0.0_f32, f32::max);
-        widgets::health_bar(ui, w, tr(T::Pistons, lang), min(&h.piston));
-        widgets::health_bar(ui, w, tr(T::Rings, lang), min(&h.rings));
-        widgets::health_bar(ui, w, tr(T::Valves, lang), min(&h.valves));
-        widgets::health_bar(ui, w, tr(T::RodFatigue, lang), 1.0 - max(&h.rod_life_used));
-        widgets::health_bar(ui, w, tr(T::HeadGasket, lang), h.head_gasket);
-        widgets::health_bar(ui, w, tr(T::CylinderHead, lang), h.cylinder_head);
-        widgets::health_bar(ui, w, tr(T::Bearings, lang), h.bearings);
-        if self.sim.spec().turbo.is_some() {
-            widgets::health_bar(ui, w, tr(T::Turbo, lang), h.turbo);
+        // A failed part reads 0 % whatever its wear model says (a rod thrown by over-rev
+        // still has fatigue life left on paper).
+        let failed = match t.condition {
+            EngineCondition::Failed(cause) => Some(cause),
+            _ => None,
+        };
+        let part = |value: f32, broke: fn(FailureCause) -> bool| {
+            if failed.is_some_and(broke) {
+                0.0
+            } else {
+                value
+            }
+        };
+        let bars = [
+            (
+                T::Pistons,
+                part(min(&h.piston), |c| {
+                    matches!(
+                        c,
+                        FailureCause::HoledPiston { .. } | FailureCause::MeltedPiston { .. }
+                    )
+                }),
+            ),
+            (T::Rings, min(&h.rings)),
+            (
+                T::Valves,
+                part(min(&h.valves), |c| {
+                    matches!(c, FailureCause::BentValve { .. })
+                }),
+            ),
+            (
+                T::Rods,
+                part(1.0 - max(&h.rod_life_used), |c| {
+                    matches!(
+                        c,
+                        FailureCause::ThrownRod { .. } | FailureCause::BentRod { .. }
+                    )
+                }),
+            ),
+            (
+                T::HeadGasket,
+                part(h.head_gasket, |c| {
+                    matches!(c, FailureCause::HeadGasket { .. })
+                }),
+            ),
+            (
+                T::CylinderHead,
+                part(h.cylinder_head, |c| matches!(c, FailureCause::WarpedHead)),
+            ),
+            (
+                T::Bearings,
+                part(h.bearings, |c| matches!(c, FailureCause::SpunBearing)),
+            ),
+        ];
+        for (label, value) in bars {
+            widgets::health_bar(ui, w, tr(label, lang), value);
         }
-        widgets::health_bar(ui, w, tr(T::Catalyst, lang), h.catalyst);
+        if self.sim.spec().turbo.is_some() {
+            let turbo = part(h.turbo, |c| matches!(c, FailureCause::TurboFailure));
+            widgets::health_bar(ui, w, tr(T::Turbo, lang), turbo);
+        }
+        let catalyst = part(h.catalyst, |c| matches!(c, FailureCause::CatalystMeltdown));
+        widgets::health_bar(ui, w, tr(T::Catalyst, lang), catalyst);
     }
 
     fn dashboard(&mut self, ui: &mut egui::Ui) {
@@ -643,24 +781,26 @@ impl TunerApp {
             );
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    let map_max = if turbo { 250.0 } else { 110.0 };
+                    let map_max = if turbo { 250.0 } else { 120.0 };
                     let mut g = Gauge::new(tr(T::Manifold, lang), "kPa", 0.0, map_max, r.map_kpa)
                         .step(if turbo { 50.0 } else { 20.0 });
                     if turbo && t.boost_target_kpa > 0.0 {
                         g = g.marker(t.boost_target_kpa, CYAN);
                     }
                     widgets::round_gauge(ui, small, &g);
-                    // `f32::min` would turn a missing reading (NaN) into the cap.
-                    let lambda = if r.lambda.is_finite() {
-                        r.lambda.min(1.6)
+                    // No reading during fuel cut (the probe sees air); off-scale values pin
+                    // the needle in the end zone.
+                    let lambda = if t.injector_pulse_ms > 0.0 {
+                        r.lambda
                     } else {
                         f32::NAN
                     };
+                    // Lean is what destroys engines (red); rich only costs power (amber).
                     let mut g = Gauge::new(tr(T::Lambda, lang), "λ", 0.6, 1.4, lambda)
                         .decimals(2)
                         .step(0.1)
-                        .caution(1.05, 1.4)
-                        .danger(0.6, 0.72);
+                        .caution(0.6, 0.75)
+                        .danger(1.1, 1.4);
                     if running {
                         g = g.marker(t.lambda_target, CYAN);
                     }
@@ -668,18 +808,18 @@ impl TunerApp {
                     widgets::round_gauge(
                         ui,
                         small,
-                        &Gauge::new(tr(T::Coolant, lang), "°C", 0.0, 140.0, r.coolant_c)
-                            .step(20.0)
+                        &Gauge::new(tr(T::Coolant, lang), "°C", -40.0, 160.0, r.coolant_c)
+                            .step(40.0)
                             .caution(105.0, 115.0)
-                            .danger(115.0, 140.0),
+                            .danger(115.0, 160.0),
                     );
                 });
                 ui.horizontal(|ui| {
                     widgets::round_gauge(
                         ui,
                         small,
-                        &Gauge::new(tr(T::OilTemp, lang), "°C", 0.0, 160.0, r.oil_temp_c)
-                            .step(20.0)
+                        &Gauge::new(tr(T::OilTemp, lang), "°C", -40.0, 160.0, r.oil_temp_c)
+                            .step(40.0)
                             .caution(125.0, 135.0)
                             .danger(135.0, 160.0),
                     );
@@ -698,11 +838,11 @@ impl TunerApp {
                                 tr(T::TurboSpeed, lang),
                                 "krpm",
                                 0.0,
-                                220.0,
+                                240.0,
                                 r.turbo_rpm / 1000.0,
                             )
                             .step(40.0)
-                            .danger(190.0, 220.0),
+                            .danger(190.0, 240.0),
                         );
                     } else {
                         widgets::round_gauge(
@@ -717,7 +857,8 @@ impl TunerApp {
         });
 
         // Digital tiles; engine-output readouts are blank while the crank is at rest.
-        let tile = Vec2::new(((avail - 6.0 * 8.0) / 6.0).floor().max(100.0), 52.0);
+        let per_row = ((avail + 8.0) / (130.0 + 8.0)).floor().clamp(3.0, 6.0);
+        let tile = Vec2::new(((avail + 8.0) / per_row - 8.0).floor(), 52.0);
         let live = |v: String| if running { v } else { "—".to_owned() };
         let knock_max = t.knock_retard_deg[..t.cylinders.max(1)]
             .iter()
@@ -758,10 +899,10 @@ impl TunerApp {
                 tile,
                 tr(T::Ignition2, lang),
                 &live(format!("{:.1}", t.ignition_advance_deg)),
-                &if truth {
-                    format!("° / {} {:.0}°", tr(T::Mbt, lang), t.mbt_advance_deg)
-                } else {
-                    "°".to_owned()
+                &match (truth, history::mbt(&t)) {
+                    (true, Some(mbt)) => format!("° {} {mbt:.0}°", tr(T::Mbt, lang)),
+                    (true, None) => format!("° {} —", tr(T::Mbt, lang)),
+                    (false, _) => "°".to_owned(),
                 },
                 lvl(false, false),
             );
@@ -808,13 +949,23 @@ impl TunerApp {
                 "°C",
                 lvl(r.egt_c > 950.0, r.egt_c > 880.0),
             );
-            if truth && turbo {
+            widgets::tile(
+                ui,
+                tile,
+                tr(T::Throttle, lang),
+                &format!("{:.0}", t.throttle_pct),
+                &format!("% · {} {:.0} %", tr(T::PedalShort, lang), t.pedal_pct),
+                Level::Normal,
+            );
+            if turbo {
+                // Boost as a boost gauge reads it: manifold pressure above atmosphere.
+                let boost_bar = (r.map_kpa - r.baro_kpa) / 100.0;
                 widgets::tile(
                     ui,
                     tile,
                     tr(T::Boost, lang),
-                    &format!("{:.0}", t.boost_pressure_kpa),
-                    "kPa",
+                    &format!("{boost_bar:+.2}"),
+                    "bar",
                     lvl(false, false),
                 );
             }
@@ -923,7 +1074,7 @@ impl TunerApp {
         // Charts.
         ui.add_space(6.0);
         let h = self.history_charts_height(ui);
-        let chart = Vec2::new(((avail - 8.0) / 2.0).max(200.0), h);
+        let chart = Vec2::new(((avail - 8.0) / 2.0).floor().max(200.0), h);
         let hist = &mut self.history;
         let rpm = hist.rpm.make_contiguous().to_vec();
         let map = hist.map_kpa.make_contiguous().to_vec();
@@ -943,6 +1094,7 @@ impl TunerApp {
                 &[Series {
                     values: &rpm,
                     color: ACCENT,
+                    label: "",
                 }],
             );
             widgets::chart(
@@ -954,6 +1106,7 @@ impl TunerApp {
                 &[Series {
                     values: &map,
                     color: BLUE,
+                    label: "",
                 }],
             );
         });
@@ -968,10 +1121,12 @@ impl TunerApp {
                     Series {
                         values: &lam_t,
                         color: CYAN,
+                        label: tr(T::LegendTarget, lang),
                     },
                     Series {
                         values: &lam,
                         color: OK,
+                        label: tr(T::LegendMeasured, lang),
                     },
                 ],
             );
@@ -983,12 +1138,14 @@ impl TunerApp {
                 (-10.0, 50.0),
                 &[
                     Series {
-                        values: &mbt,
+                        values: if truth { &mbt } else { &[] },
                         color: VIOLET,
+                        label: if truth { tr(T::Mbt, lang) } else { "" },
                     },
                     Series {
                         values: &spark,
                         color: WARN,
+                        label: tr(T::LegendSpark, lang),
                     },
                 ],
             );
@@ -1012,10 +1169,12 @@ impl TunerApp {
                 )
                 .clicked()
             {
-                let spec = *self.sim.spec();
-                let cal = *self.sim.calibration();
-                let ambient = self.sim.controls().ambient;
-                self.dyno.start(spec, cal, ambient, SEED);
+                let label = format!(
+                    "{} · {:.0} RON",
+                    tr(self.preset.label(), lang),
+                    self.inputs.octane
+                );
+                self.dyno.start(self.sim.clone(), label);
             }
             if running {
                 ui.add(
@@ -1042,30 +1201,30 @@ impl TunerApp {
                 .strong(),
             );
         }
-        ui.horizontal(|ui| {
-            for (run, label, color) in [
-                (Some(&current), T::CurrentRun, ACCENT),
-                (previous.as_ref(), T::PreviousRun, DIM),
-            ] {
-                let Some(run) = run else { continue };
-                if let (Some(tq), Some(pw)) = (run.peak_torque(), run.peak_power()) {
-                    ui.label(
-                        RichText::new(format!(
-                            "{}: {} {:.0} N·m @ {:.0} · {} {:.1} kW @ {:.0}",
-                            tr(label, lang),
-                            tr(T::PeakTorque, lang),
-                            tq.torque_nm,
-                            tq.rpm,
-                            tr(T::PeakPower, lang),
-                            pw.power_kw,
-                            pw.rpm
-                        ))
-                        .color(color),
-                    );
-                    ui.separator();
-                }
+        // One line per run, labelled with the engine and fuel it was measured on.
+        for (run, label, color) in [
+            (Some(&current), T::CurrentRun, ACCENT),
+            (previous.as_ref(), T::PreviousRun, DIM),
+        ] {
+            let Some(run) = run else { continue };
+            if let (Some(tq), Some(pw)) = (run.peak_torque(), run.peak_power()) {
+                ui.label(
+                    RichText::new(format!(
+                        "{} ({}): {} {:.0} N·m @ {:.0} · {} {:.1} kW @ {:.0} {}",
+                        tr(label, lang),
+                        run.label,
+                        tr(T::PeakTorque, lang),
+                        tq.torque_nm,
+                        tq.rpm,
+                        tr(T::PeakPower, lang),
+                        pw.power_kw,
+                        pw.rpm,
+                        tr(T::AxisRpm, lang),
+                    ))
+                    .color(color),
+                );
             }
-        });
+        }
         dyno_chart(
             ui,
             &current,
@@ -1073,44 +1232,42 @@ impl TunerApp {
             self.sim.spec().limits.redline_rpm,
         );
         ui.add_space(6.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("dyno_table")
-                .striped(true)
-                .num_columns(9)
-                .show(ui, |ui| {
-                    for h in [
-                        "rpm",
-                        "N·m",
-                        "kW",
-                        "λ",
-                        "°BTDC",
-                        "MBT",
-                        "MAP kPa",
-                        "EGT °C",
-                        "knock bar",
-                    ] {
-                        ui.label(RichText::new(h).color(DIM).monospace());
-                    }
+        egui::Grid::new("dyno_table")
+            .striped(true)
+            .num_columns(9)
+            .show(ui, |ui| {
+                for h in [
+                    tr(T::AxisRpm, lang),
+                    "N·m",
+                    "kW",
+                    "λ",
+                    tr(T::ColSpark, lang),
+                    "MBT",
+                    "MAP kPa",
+                    "EGT °C",
+                    tr(T::ColKnock, lang),
+                ] {
+                    ui.label(RichText::new(h).color(DIM).monospace());
+                }
+                ui.end_row();
+                for p in &current.points {
+                    ui.monospace(format!("{:.0}", p.rpm));
+                    ui.monospace(format!("{:.1}", p.torque_nm));
+                    ui.monospace(format!("{:.1}", p.power_kw));
+                    ui.monospace(format!("{:.3}", p.lambda));
+                    ui.monospace(format!("{:.1}", p.spark_deg));
+                    ui.monospace(format!("{:.1}", p.mbt_deg));
+                    ui.monospace(format!("{:.1}", p.map_kpa));
+                    ui.monospace(format!("{:.0}", p.egt_c));
+                    let knock = RichText::new(format!("{:.2}", p.knock_bar)).monospace();
+                    ui.label(if p.knock_bar > 0.5 {
+                        knock.color(DANGER)
+                    } else {
+                        knock
+                    });
                     ui.end_row();
-                    for p in &current.points {
-                        ui.monospace(format!("{:.0}", p.rpm));
-                        ui.monospace(format!("{:.1}", p.torque_nm));
-                        ui.monospace(format!("{:.1}", p.power_kw));
-                        ui.monospace(format!("{:.3}", p.lambda));
-                        ui.monospace(format!("{:.1}", p.spark_deg));
-                        ui.monospace(format!("{:.1}", p.mbt_deg));
-                        ui.monospace(format!("{:.1}", p.map_kpa));
-                        ui.monospace(format!("{:.0}", p.egt_c));
-                        let knock = RichText::new(format!("{:.2}", p.knock_bar)).monospace();
-                        ui.label(if p.knock_bar > 0.5 {
-                            knock.color(DANGER)
-                        } else {
-                            knock
-                        });
-                        ui.end_row();
-                    }
-                });
-        });
+                }
+            });
     }
 
     fn autopsy_tab(&mut self, ui: &mut egui::Ui) {
@@ -1122,6 +1279,7 @@ impl TunerApp {
             .clicked()
         {
             self.autopsy.new_case(&mut self.sim);
+            self.clear_log();
         }
         ui.add_space(6.0);
         let Some(fault) = self.autopsy.fault else {
@@ -1132,12 +1290,22 @@ impl TunerApp {
         ui.add_space(6.0);
         ui.label(RichText::new(tr(T::YourDiagnosis, lang)).strong());
         let turbo = self.sim.spec().turbo.is_some();
+        // After the reveal the case is over: no more answers to score.
+        let open = !self.autopsy.revealed;
+        // Two columns of answers only where both fit next to each other.
+        let columns = if ui.available_width() >= 840.0 { 2 } else { 1 };
         egui::Grid::new("autopsy_answers")
-            .num_columns(2)
+            .num_columns(columns)
             .show(ui, |ui| {
                 for (i, id) in autopsy::candidates(turbo).into_iter().enumerate() {
-                    ui.radio_value(&mut self.autopsy.answer, Some(id), id.localized(lang));
-                    if i % 2 == 1 {
+                    let chosen = self.autopsy.answer == Some(id);
+                    if ui
+                        .add_enabled(open, egui::RadioButton::new(chosen, id.localized(lang)))
+                        .clicked()
+                    {
+                        self.autopsy.answer = Some(id);
+                    }
+                    if i % columns == columns - 1 {
                         ui.end_row();
                     }
                 }
@@ -1146,7 +1314,7 @@ impl TunerApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.autopsy.answer.is_some(),
+                    open && self.autopsy.answer.is_some(),
                     egui::Button::new(tr(T::Check, lang)),
                 )
                 .clicked()
@@ -1236,7 +1404,11 @@ fn dyno_chart(
     redline: f32,
 ) {
     use egui::{Align2, CornerRadius, FontId, Pos2, Sense, Stroke, StrokeKind};
-    let size = Vec2::new(ui.available_width(), 260.0);
+    // The visible width, so the kW axis never ends up under the side panel.
+    let width = ui
+        .available_width()
+        .min(ui.clip_rect().right() - ui.cursor().min.x);
+    let size = Vec2::new(width.max(320.0), 260.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, CornerRadius::same(4), FACE);
@@ -1332,6 +1504,23 @@ fn dyno_chart(
         if tq.len() >= 2 {
             p.line(tq, Stroke::new(2.0, ACCENT.gamma_multiply(fade)));
             p.line(pw, Stroke::new(2.0, BLUE.gamma_multiply(fade)));
+        }
+    }
+}
+
+/// Percentage slider that shows (and locks at) the value of a held key while it overrides
+/// the panel setting.
+fn held_slider(ui: &mut egui::Ui, value: &mut f32, held: Option<f32>) {
+    match held {
+        Some(v) => {
+            let mut shown = v;
+            ui.add_enabled(
+                false,
+                egui::Slider::new(&mut shown, 0.0..=100.0).suffix(" %"),
+            );
+        }
+        None => {
+            ui.add(egui::Slider::new(value, 0.0..=100.0).suffix(" %"));
         }
     }
 }

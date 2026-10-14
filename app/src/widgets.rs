@@ -104,8 +104,14 @@ impl<'a> Gauge<'a> {
         ((v - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
     }
 
+    /// Whether the value lies in `zone`; a value off the scale counts as the end it is
+    /// pinned to, so an end-stop reading keeps the colour of the zone it is beyond.
     fn in_zone(&self, zone: Option<(f32, f32)>) -> bool {
-        zone.is_some_and(|(a, b)| self.value >= a && self.value <= b)
+        if !self.value.is_finite() {
+            return false;
+        }
+        let v = self.value.clamp(self.min, self.max);
+        zone.is_some_and(|(a, b)| v >= a && v <= b)
     }
 }
 
@@ -159,7 +165,8 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
 
     // Scale: major ticks with labels, minor ticks halfway.
     if g.major_step > 0.0 && g.max > g.min {
-        let n = ((g.max - g.min) / g.major_step).round() as usize;
+        // Labels only up to the end of the scale (a partial last step gets no label).
+        let n = ((g.max - g.min) / g.major_step + 1.0e-3).floor() as usize;
         let label_font = FontId::proportional((r * 0.13).clamp(9.0, 15.0));
         for i in 0..=n {
             let v = g.min + g.major_step * i as f32;
@@ -171,7 +178,7 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
                 ],
                 Stroke::new(1.5, TEXT),
             );
-            if i < n {
+            if g.min + g.major_step * (i as f32 + 0.5) <= g.max + 1.0e-3 {
                 let fm = g.fraction(v + g.major_step * 0.5);
                 p.line_segment(
                     [
@@ -250,7 +257,7 @@ impl Level {
     }
 }
 
-/// Rectangular digital readout: label, value and unit.
+/// Rectangular digital readout: label, value and unit (or a short secondary text).
 pub fn tile(ui: &mut egui::Ui, size: Vec2, label: &str, value: &str, unit: &str, level: Level) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
@@ -273,19 +280,37 @@ pub fn tile(ui: &mut egui::Ui, size: Vec2, label: &str, value: &str, unit: &str,
         FontId::proportional(12.0),
         DIM,
     );
+    // The unit follows the value on its baseline; when both do not fit, the value font
+    // shrinks so the two never overlap.
+    let unit_font = FontId::proportional(12.0);
+    let unit_w = p
+        .layout_no_wrap(unit.to_owned(), unit_font.clone(), DIM)
+        .size()
+        .x;
+    let mut value_size = (size.y * 0.42).clamp(12.0, 26.0);
+    let value_w = p
+        .layout_no_wrap(value.to_owned(), FontId::monospace(value_size), TEXT)
+        .size()
+        .x;
+    let room = size.x - 16.0 - 5.0 - unit_w;
+    if value_w > room && value_w > 0.0 {
+        value_size = (value_size * room / value_w).max(10.0);
+    }
+    let value_w = value_w * value_size / (size.y * 0.42).clamp(12.0, 26.0);
+    let baseline = rect.bottom() - 6.0;
     p.text(
-        rect.right_bottom() - Vec2::new(8.0, 6.0),
-        Align2::RIGHT_BOTTOM,
-        unit,
-        FontId::proportional(12.0),
-        DIM,
-    );
-    p.text(
-        Pos2::new(rect.left() + 8.0, rect.bottom() - 6.0),
+        Pos2::new(rect.left() + 8.0, baseline),
         Align2::LEFT_BOTTOM,
         value,
-        FontId::monospace((size.y * 0.42).clamp(12.0, 26.0)),
+        FontId::monospace(value_size),
         level.color(),
+    );
+    p.text(
+        Pos2::new(rect.left() + 8.0 + value_w + 5.0, baseline - 2.0),
+        Align2::LEFT_BOTTOM,
+        unit,
+        unit_font,
+        DIM,
     );
 }
 
@@ -331,10 +356,11 @@ pub fn health_bar(ui: &mut egui::Ui, width: f32, label: &str, value: f32) {
     );
 }
 
-/// One line of a chart.
+/// One line of a chart; a non-empty `label` adds a legend entry.
 pub struct Series<'a> {
     pub values: &'a [f32],
     pub color: Color32,
+    pub label: &'a str,
 }
 
 /// Scrolling line chart over a fixed number of samples, newest on the right.
@@ -390,25 +416,50 @@ pub fn chart(
         FontId::proportional(12.0),
         DIM,
     );
+    // Legend, right-aligned on the title row.
+    let mut x = rect.right() - 8.0;
+    for s in series.iter().rev().filter(|s| !s.label.is_empty()) {
+        let text = p.text(
+            Pos2::new(x, rect.top() + 4.0),
+            Align2::RIGHT_TOP,
+            s.label,
+            FontId::proportional(11.0),
+            TEXT,
+        );
+        let swatch = Rect::from_center_size(
+            Pos2::new(text.left() - 9.0, text.center().y),
+            Vec2::new(12.0, 3.0),
+        );
+        p.rect_filled(swatch, CornerRadius::ZERO, s.color);
+        x = swatch.left() - 10.0;
+    }
     let cap = capacity.max(2);
     for s in series {
         let n = s.values.len();
-        if n < 2 {
-            continue;
-        }
-        let points: Vec<Pos2> = s
-            .values
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| v.is_finite())
-            .map(|(i, v)| {
+        // A missing sample (NaN: engine stopped, reading invalid) breaks the line instead of
+        // being bridged by a straight segment.
+        let mut run: Vec<Pos2> = Vec::new();
+        for (i, v) in s.values.iter().enumerate() {
+            if v.is_finite() {
                 let x = plot.right() - plot.width() * (n - 1 - i) as f32 / (cap - 1) as f32;
                 let y = plot.bottom() - plot.height() * ((v - y0) / span).clamp(-0.02, 1.02);
-                Pos2::new(x, y)
-            })
-            .collect();
-        if points.len() >= 2 {
-            p.line(points, Stroke::new(1.6, s.color));
+                run.push(Pos2::new(x, y));
+            } else if !run.is_empty() {
+                draw_run(&p, std::mem::take(&mut run), s.color);
+            }
+        }
+        draw_run(&p, run, s.color);
+    }
+}
+
+fn draw_run(p: &egui::Painter, run: Vec<Pos2>, color: Color32) {
+    match run.len() {
+        0 => {}
+        1 => {
+            p.circle_filled(run[0], 1.2, color);
+        }
+        _ => {
+            p.line(run, Stroke::new(1.6, color));
         }
     }
 }

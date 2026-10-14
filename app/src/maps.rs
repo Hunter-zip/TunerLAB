@@ -8,7 +8,7 @@ use eframe::egui::{
 use tunerlab_core::engine_sim::calibration::Table2D;
 use tunerlab_core::{Calibration, EngineSim, Language};
 
-use crate::text::{tr, T};
+use crate::text::{cells, tr, T};
 use crate::widgets::{heat, palette::*};
 
 /// Editable 2-D maps.
@@ -60,6 +60,24 @@ impl MapKind {
         match self {
             MapKind::Boost => T::AxisPedal,
             _ => T::AxisMap,
+        }
+    }
+
+    /// Range the core accepts for a cell, in display units (`Calibration::validate`).
+    fn limits(self) -> (f32, f32) {
+        match self {
+            MapKind::Ve => (0.0, 200.0),
+            MapKind::Ignition => (-30.0, 70.0),
+            MapKind::Lambda => (0.5, 1.6),
+            MapKind::Boost => (50.0, 500.0),
+        }
+    }
+
+    /// Row-axis coordinate of the operating point, e.g. "MAP 25 kPa" or "pedał 30 %".
+    fn y_value_text(self, v: f32, lang: Language) -> String {
+        match self {
+            MapKind::Boost => format!("{} {v:.0} %", tr(T::PedalShort, lang)),
+            _ => format!("MAP {v:.0} kPa"),
         }
     }
 }
@@ -168,7 +186,8 @@ pub struct MapEditor {
     selection: Option<Selection>,
     step: f32,
     set_value: f32,
-    error: Option<String>,
+    /// The last edit was rejected by the calibration validator.
+    rejected: bool,
 }
 
 impl Default for MapEditor {
@@ -178,7 +197,7 @@ impl Default for MapEditor {
             selection: None,
             step: MapKind::Ve.default_step(),
             set_value: 0.0,
-            error: None,
+            rejected: false,
         }
     }
 }
@@ -187,19 +206,26 @@ impl MapEditor {
     fn apply(&mut self, sim: &mut EngineSim, op: Op) {
         let Some(sel) = self.selection else { return };
         let kind = self.kind;
-        self.error = sim
+        self.rejected = sim
             .update_calibration(|cal| table_edit(cal, kind, &sel, op))
-            .err()
-            .map(|e| e.to_string());
+            .is_err();
+    }
+
+    /// Switches to another table with its own default step and no selection.
+    fn select_kind(&mut self, kind: MapKind) {
+        self.kind = kind;
+        self.selection = None;
+        self.step = kind.default_step();
+        self.rejected = false;
     }
 
     /// Draws the editor.
     pub fn show(&mut self, ui: &mut egui::Ui, sim: &mut EngineSim, lang: Language) {
         let turbo = sim.calibration().engine.turbocharged;
         if self.kind == MapKind::Boost && !turbo {
-            self.kind = MapKind::Ve;
+            self.select_kind(MapKind::Ve);
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(tr(T::Table, lang)).color(DIM));
             let mut kinds = vec![MapKind::Ve, MapKind::Ignition, MapKind::Lambda];
             if turbo {
@@ -211,10 +237,7 @@ impl MapEditor {
                     .clicked()
                     && self.kind != k
                 {
-                    self.kind = k;
-                    self.selection = None;
-                    self.step = k.default_step();
-                    self.error = None;
+                    self.select_kind(k);
                 }
             }
         });
@@ -235,13 +258,12 @@ impl MapEditor {
         );
 
         // Edit toolbar.
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let count = self.selection.map_or(0, |s| s.count());
             ui.label(format!(
-                "{}: {} {}",
+                "{}: {}",
                 tr(T::Selection, lang),
-                count,
-                tr(T::Cells, lang)
+                cells(count, lang)
             ));
             ui.separator();
             ui.label(tr(T::Step, lang));
@@ -266,35 +288,43 @@ impl MapEditor {
             ui.separator();
             if ui.button(tr(T::RestoreBase, lang)).clicked() {
                 let base = Calibration::base_for(sim.spec());
-                self.error = sim
+                self.rejected = sim
                     .update_calibration(|cal| table_restore(cal, &base, kind))
-                    .err()
-                    .map(|e| e.to_string());
+                    .is_err();
             }
         });
-        if let Some(err) = &self.error {
+        if self.rejected {
+            let (lo, hi) = kind.limits();
+            let d = kind.decimals();
             ui.label(
-                RichText::new(format!("{}: {err}", tr(T::CalibrationRejected, lang))).color(DANGER),
+                RichText::new(format!(
+                    "{}: {} ({lo:.d$} … {hi:.d$})",
+                    tr(T::CalibrationRejected, lang),
+                    tr(T::ValueOutOfRange, lang),
+                ))
+                .color(DANGER),
             );
         }
         ui.label(
             RichText::new(format!(
-                "{}: {:.0} {} · {:.0} {}",
+                "{}: {:.0} {} · {}",
                 tr(T::OperatingPoint, lang),
                 s.rpm,
                 tr(T::AxisRpm, lang),
-                if kind == MapKind::Boost {
-                    s.pedal_pct
-                } else {
-                    s.map_kpa
-                },
-                tr(kind.y_axis_label(), lang),
+                kind.y_value_text(
+                    if kind == MapKind::Boost {
+                        s.pedal_pct
+                    } else {
+                        s.map_kpa
+                    },
+                    lang
+                ),
             ))
             .color(CYAN),
         );
 
-        // Keyboard step editing.
-        if !ui.ctx().egui_wants_keyboard_input() {
+        // Keyboard step editing (not while a number is being typed).
+        if !ui.ctx().text_edit_focused() {
             let (plus, minus) = ui.input(|i| {
                 (
                     i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals),
@@ -321,7 +351,9 @@ impl MapEditor {
         let header_w = 64.0;
         let header_h = 22.0;
         let avail = ui.available_size();
-        let cell_w = ((avail.x - header_w - 4.0) / nx as f32).clamp(34.0, 72.0);
+        // The visible width: a wide row above must not push the grid under the side panel.
+        let width = avail.x.min(ui.clip_rect().right() - ui.cursor().min.x);
+        let cell_w = ((width - header_w - 4.0) / nx as f32).clamp(30.0, 72.0);
         let cell_h = ((avail.y - header_h - 24.0) / ny as f32).clamp(16.0, 26.0);
         let size = Vec2::new(header_w + cell_w * nx as f32, header_h + cell_h * ny as f32);
         let (resp, p) = ui.allocate_painter(size, Sense::click_and_drag());
@@ -375,7 +407,13 @@ impl MapEditor {
                 (lo.min(v), hi.max(v))
             });
         let span = (hi - lo).max(1.0e-6);
-        let font = FontId::monospace(if cell_w < 44.0 { 10.0 } else { 11.5 });
+        let font = FontId::monospace(if cell_w < 36.0 {
+            9.0
+        } else if cell_w < 44.0 {
+            10.0
+        } else {
+            11.5
+        });
         // Corner cell: column axis top-right, row axis bottom-left.
         p.text(
             origin + Vec2::new(header_w - 3.0, 2.0),
@@ -512,7 +550,7 @@ mod tests {
             ..MapEditor::default()
         };
         editor.apply(&mut sim, Op::Set(-1.0));
-        assert!(editor.error.is_some());
+        assert!(editor.rejected);
         assert_eq!(*sim.calibration(), before);
     }
 }

@@ -70,6 +70,17 @@ impl Readout {
     }
 }
 
+/// MBT advance when it describes a real firing cycle: `None` during fuel cut, deep overrun
+/// (MAP below 15 kPa) or when the estimate sits on a bound of the core's −10…65° search.
+pub fn mbt(t: &Telemetry) -> Option<f32> {
+    let valid = t.rpm > 1.0
+        && t.injector_duty_pct > 0.5
+        && t.manifold_pressure_kpa > 15.0
+        && t.mbt_advance_deg > -9.5
+        && t.mbt_advance_deg < 64.5;
+    valid.then_some(t.mbt_advance_deg)
+}
+
 /// Samples kept per channel: 30 s at 20 Hz.
 pub const SAMPLES: usize = 600;
 /// Simulated time between samples \[s\].
@@ -116,7 +127,7 @@ impl History {
         push(&mut self.lambda, lambda);
         push(&mut self.lambda_target, gate(t.lambda_target));
         push(&mut self.spark, gate(t.ignition_advance_deg));
-        push(&mut self.mbt, gate(t.mbt_advance_deg));
+        push(&mut self.mbt, mbt(t).unwrap_or(f32::NAN));
     }
 
     /// Forgets everything (new engine, reset).

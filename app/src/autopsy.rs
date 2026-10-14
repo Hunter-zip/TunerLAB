@@ -166,6 +166,10 @@ impl Autopsy {
         let (Some(fault), Some(answer)) = (self.fault, self.answer) else {
             return;
         };
+        // Once the solution is shown, checking it would score nothing.
+        if self.revealed {
+            return;
+        }
         self.attempts += 1;
         self.verdict = Some(if fault.id() == answer {
             Verdict::Correct
@@ -187,9 +191,16 @@ impl Autopsy {
 /// Name and severity of a planted fault, for the solution screen.
 pub fn describe(fault: &Fault, lang: Language) -> String {
     let name = fault.id().localized(lang);
-    let cyl = match lang {
-        Language::En => "cylinder",
-        Language::Pl => "cyl.",
+    // Every percentage is named, so "85 %" cannot be read as the wrong quantity.
+    let (cyl, flow, strength, leak, capacity) = match lang {
+        Language::En => ("cylinder", "flow", "coil strength", "leakage", "capacity"),
+        Language::Pl => (
+            "cyl.",
+            "przepływ",
+            "sprawność cewki",
+            "nieszczelność",
+            "wydajność",
+        ),
     };
     let detail = match *fault {
         Fault::MapSensorBias { kpa } => format!("{kpa:+.0} kPa"),
@@ -202,17 +213,28 @@ pub fn describe(fault: &Fault, lang: Language) -> String {
         Fault::InjectorClogged {
             cylinder,
             flow_fraction,
-        } => format!("{cyl} {}, {:.0} %", cylinder + 1, flow_fraction * 100.0),
-        Fault::IgnitionCoilWeak { cylinder, strength } => {
-            format!("{cyl} {}, {:.0} %", cylinder + 1, strength * 100.0)
-        }
+        } => format!(
+            "{cyl} {}, {flow} {:.0} %",
+            cylinder + 1,
+            flow_fraction * 100.0
+        ),
+        Fault::IgnitionCoilWeak {
+            cylinder,
+            strength: s,
+        } => format!("{cyl} {}, {strength} {:.0} %", cylinder + 1, s * 100.0),
         Fault::TimingChainStretch { retard_deg } => format!("{retard_deg:.0}°"),
-        Fault::FuelPumpWeak { capacity_fraction } => format!("{:.0} %", capacity_fraction * 100.0),
+        Fault::FuelPumpWeak { capacity_fraction } => {
+            format!("{capacity} {:.0} %", capacity_fraction * 100.0)
+        }
         Fault::ExhaustRestriction { factor } => format!("× {factor:.1}"),
         Fault::LowCompression {
             cylinder,
             leak_fraction,
-        } => format!("{cyl} {}, {:.0} %", cylinder + 1, leak_fraction * 100.0),
+        } => format!(
+            "{cyl} {}, {leak} {:.0} %",
+            cylinder + 1,
+            leak_fraction * 100.0
+        ),
         Fault::IntakeAirSensorOpen
         | Fault::KnockSensorDead
         | Fault::ThermostatStuckOpen

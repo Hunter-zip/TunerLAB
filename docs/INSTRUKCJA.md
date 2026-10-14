@@ -18,9 +18,9 @@ cargo run --release -p tunerlab-app
 | Górny pasek | wybór silnika (2.0 wolnossący / 2.0 turbo), zakładki, **Widok**: *Czujniki ECU* (to, co widzi datalogger) lub *Instruktor (prawda)* (rzeczywiste wartości fizyczne, MBT, ciśnienie w cylindrach), tempo symulacji 1×/2×/5×, pauza, język PL/EN |
 | Lewy panel | stacyjka, rozrusznik, pedał gazu, obciążenie: bez obciążenia / hamownia / samochód (bieg, sprzęgło, hamulec, nachylenie), otoczenie (temperatura, ciśnienie, paliwo RON, obciążenie elektryczne), warsztat (rozgrzej, wystudź, napraw, reset) |
 | Prawy panel | stan silnika, ostrzeżenia instruktora, zapisane kody usterek (DTC) z kasowaniem, stan podzespołów |
-| **Pulpit** | obrotomierz, MAP, lambda z wartością docelową, temperatury i ciśnienie oleju, kafelki (moment, moc, zapłon, cofnięcie stuku, wtrysk, korekty paliwa…), tabela cylindrów, wykresy z 30 s |
+| **Pulpit** | obrotomierz, MAP, lambda z wartością docelową, temperatury i ciśnienie oleju, kafelki (moment, moc, zapłon, korekta stukowa, wtrysk, korekty paliwa, przepustnica, doładowanie w barach…), tabela cylindrów, wykresy z 30 s |
 | **Mapy** | tablice VE, zapłonu, docelowej lambdy i (turbo) doładowania; zaznaczanie myszą, zmiana o krok (+/−), ustawianie wartości, przywracanie mapy bazowej; kropka pokazuje bieżący punkt pracy |
-| **Hamownia** | pomiar mocy przy pełnym gazie na kopii silnika z bieżącą kalibracją; krzywe momentu i mocy porównane z poprzednim pomiarem |
+| **Hamownia** | pomiar mocy przy pełnym gazie na kopii bieżącego silnika (kalibracja, paliwo, ukryte usterki, zużycie); krzywe momentu i mocy porównane z poprzednim pomiarem, każdy opisany silnikiem i paliwem |
 | **Engine Autopsy** | ukryta usterka do zdiagnozowania (17 rodzajów) |
 | **Dziennik** | zdarzenia z czasem: zmiany stanu, ostrzeżenia, kody, uszkodzenia |
 
@@ -48,7 +48,7 @@ cargo run --release -p tunerlab-app
 4. **Strojenie zapłonu.** *Mapy* → *Wyprzedzenie zapłonu*: zaznacz obszar 3200–5000 obr/min
    przy pełnym obciążeniu (88–105 kPa) i dodaj 4–6° (+). Ponowny pomiar na hamowni: moment
    praktycznie nie rośnie (mapa bazowa jest już przy MBT i granicy stuku), w tabeli pomiaru
-   pojawia się stuk (czerwony, ok. 1 bar), a ECU cofa zapłon (kafelek *Cofnięcie stuku*,
+   pojawia się stuk (czerwony, ok. 1 bar), a ECU cofa zapłon (kafelek *Korekta stukowa*,
    tabela cylindrów). Na paliwie 91 RON stuk i cofanie są wyraźnie większe — przełącz
    *Paliwo (RON)*. Wniosek dla kursanta: więcej zapłonu ≠ więcej mocy.
 5. **Mieszanka.** *Docelowa lambda* przy pełnym obciążeniu: zubożenie do 0.95 (z 0.84) daje

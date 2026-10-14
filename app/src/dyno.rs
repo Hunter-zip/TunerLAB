@@ -1,13 +1,11 @@
-//! Wide-open-throttle power sweep on a copy of the engine, run on a worker thread so the
-//! dashboard keeps updating.
+//! Wide-open-throttle power sweep on a copy of the live engine (calibration, hidden faults,
+//! damage, fuel and ambient included), run on a worker thread so the dashboard keeps
+//! updating.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-use tunerlab_core::{
-    Ambient, Calibration, DynoParams, EngineCondition, EngineSim, EngineSpec, FailureCause,
-    LoadModel,
-};
+use tunerlab_core::{DynoParams, EngineCondition, EngineSim, FailureCause, LoadModel};
 
 /// Frame period used to drive the simulation copy \[s\].
 const FRAME_S: f32 = 1.0 / 60.0;
@@ -37,6 +35,8 @@ pub struct DynoPoint {
 /// A complete (or aborted) sweep.
 #[derive(Debug, Clone, Default)]
 pub struct DynoRun {
+    /// What was measured (engine and fuel), shown with the results.
+    pub label: String,
     pub points: Vec<DynoPoint>,
     pub failure: Option<FailureCause>,
 }
@@ -75,28 +75,23 @@ impl DynoBench {
         self.worker.is_some()
     }
 
-    /// Starts a sweep of `spec` on `calibration` at `ambient`; the current run becomes the
-    /// previous one.
-    pub fn start(
-        &mut self,
-        spec: EngineSpec,
-        calibration: Calibration,
-        ambient: Ambient,
-        seed: u64,
-    ) {
+    /// Starts a sweep of `engine` (a copy of the live simulation); the current run becomes
+    /// the previous one.
+    pub fn start(&mut self, engine: EngineSim, label: String) {
         if self.running() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         self.previous = self.current.take();
-        self.current = Some(DynoRun::default());
+        self.current = Some(DynoRun {
+            label,
+            ..DynoRun::default()
+        });
         self.progress = 0.0;
         self.worker = Some(rx);
         thread::spawn(move || {
-            let failure = sweep(spec, calibration, ambient, seed, |m| {
-                // The receiver disappears only when the app closes: stop quietly then.
-                tx.send(m).is_ok()
-            });
+            // The receiver disappears only when the bench is dropped: stop quietly then.
+            let failure = sweep(engine, |m| tx.send(m).is_ok());
             let _ = tx.send(Msg::Done(failure));
         });
     }
@@ -143,28 +138,26 @@ fn failed(sim: &EngineSim) -> Option<FailureCause> {
     }
 }
 
-/// Runs the sweep, reporting through `send` (which returns `false` to abort).
-fn sweep(
-    spec: EngineSpec,
-    calibration: Calibration,
-    ambient: Ambient,
-    seed: u64,
-    mut send: impl FnMut(Msg) -> bool,
-) -> Option<FailureCause> {
-    let Ok(mut sim) = EngineSim::new(spec, calibration, seed) else {
-        return None;
-    };
-    sim.update_controls(|c| c.ambient = ambient);
-    sim.soak_to_ambient();
+/// Runs the sweep on `sim`, reporting through `send` (which returns `false` to abort).
+fn sweep(mut sim: EngineSim, mut send: impl FnMut(Msg) -> bool) -> Option<FailureCause> {
+    if let Some(cause) = failed(&sim) {
+        return Some(cause);
+    }
+    // Warm engine, free of any driver input, started if it is not running.
     sim.prewarm();
     sim.update_controls(|c| {
+        c.pedal = 0.0;
+        c.load = LoadModel::Neutral;
         c.ignition_on = true;
-        c.starter = true;
+        c.starter = false;
     });
-    run_for(&mut sim, 1.5);
-    sim.update_controls(|c| c.starter = false);
+    if sim.condition() != EngineCondition::Running {
+        sim.update_controls(|c| c.starter = true);
+        run_for(&mut sim, 1.5);
+        sim.update_controls(|c| c.starter = false);
+    }
     run_for(&mut sim, 3.0);
-    let redline = spec.limits.redline_rpm;
+    let redline = sim.spec().limits.redline_rpm;
     let points = (((redline - START_RPM) / STEP_RPM).floor() as usize) + 1;
     for i in 0..points {
         let rpm = START_RPM + STEP_RPM * i as f32;
@@ -229,21 +222,31 @@ fn sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tunerlab_core::{EngineSpec, Fault};
 
-    #[test]
-    fn sweep_reproduces_the_base_power_curve() {
-        let spec = EngineSpec::naturally_aspirated_2l();
-        let cal = Calibration::base_for(&spec);
+    fn measure(sim: EngineSim) -> (Vec<DynoPoint>, Option<FailureCause>) {
         let mut points = Vec::new();
-        let failure = sweep(spec, cal, Ambient::default(), 7, |m| {
+        let failure = sweep(sim, |m| {
             if let Msg::Point(p) = m {
                 points.push(p);
             }
             true
         });
+        (points, failure)
+    }
+
+    #[test]
+    fn sweep_reproduces_the_base_power_curve() {
+        let sim =
+            EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 7).unwrap();
+        let (points, failure) = measure(sim);
         assert!(failure.is_none());
         assert!(points.len() >= 15, "{} points", points.len());
-        let run = DynoRun { points, failure };
+        let run = DynoRun {
+            label: String::new(),
+            points,
+            failure,
+        };
         let tq = run.peak_torque().unwrap();
         let pw = run.peak_power().unwrap();
         assert!(
@@ -256,5 +259,19 @@ mod tests {
             "peak power {}",
             pw.power_kw
         );
+    }
+
+    #[test]
+    fn sweep_carries_hidden_faults_of_the_live_engine() {
+        let mut sim =
+            EngineSim::with_base_calibration(EngineSpec::naturally_aspirated_2l(), 7).unwrap();
+        sim.inject_fault(Fault::FuelPumpWeak {
+            capacity_fraction: 0.3,
+        })
+        .unwrap();
+        let (points, _) = measure(sim);
+        let top = points.last().expect("points measured");
+        // A weak pump cannot hold the rail at full load: the top end leans out.
+        assert!(top.lambda > 0.95, "λ {} at {} rpm", top.lambda, top.rpm);
     }
 }

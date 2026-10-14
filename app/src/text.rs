@@ -61,7 +61,7 @@ pub enum T {
     Pistons,
     Rings,
     Valves,
-    RodFatigue,
+    Rods,
     HeadGasket,
     CylinderHead,
     Bearings,
@@ -101,6 +101,12 @@ pub enum T {
     PeakPressure,
     PistonTemp,
     Baro,
+    Throttle,
+    PedalShort,
+    LegendMeasured,
+    LegendTarget,
+    LegendSpark,
+    SoakNeedsStop,
     // Maps.
     Table,
     MapVe,
@@ -118,7 +124,7 @@ pub enum T {
     AxisRpm,
     AxisMap,
     AxisPedal,
-    Cells,
+    ValueOutOfRange,
     // Dyno.
     RunSweep,
     Measuring,
@@ -129,6 +135,8 @@ pub enum T {
     PeakPower,
     DynoFailed,
     NoRunYet,
+    ColSpark,
+    ColKnock,
     // Engine Autopsy.
     NewCase,
     AutopsyHelp,
@@ -178,10 +186,10 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::LoadNeutral => ("Free rev", "Bez obciążenia"),
         T::LoadDyno => ("Dynamometer", "Hamownia"),
         T::LoadVehicle => ("Vehicle", "Samochód"),
-        T::DynoSpeed => ("Dyno speed", "Prędkość hamowni"),
+        T::DynoSpeed => ("Dyno speed", "Obroty hamowni"),
         T::Gear => ("Gear", "Bieg"),
         T::Neutral => ("N", "N"),
-        T::Clutch => ("Clutch engaged", "Sprzęgło zwolnione"),
+        T::Clutch => ("Clutch engaged", "Sprzęgło załączone"),
         T::Brake => ("Brake", "Hamulec"),
         T::Grade => ("Road grade", "Nachylenie drogi"),
         T::Ambient => ("Ambient", "Otoczenie"),
@@ -208,7 +216,7 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::Pistons => ("Pistons", "Tłoki"),
         T::Rings => ("Rings", "Pierścienie"),
         T::Valves => ("Valves", "Zawory"),
-        T::RodFatigue => ("Rod fatigue", "Zmęczenie korbowodów"),
+        T::Rods => ("Connecting rods", "Korbowody"),
         T::HeadGasket => ("Head gasket", "Uszczelka głowicy"),
         T::CylinderHead => ("Cylinder head", "Głowica"),
         T::Bearings => ("Bearings", "Panewki"),
@@ -220,17 +228,17 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::Coolant => ("Coolant", "Płyn chł."),
         T::OilTemp => ("Oil temp", "Temp. oleju"),
         T::OilPressure => ("Oil press.", "Ciśn. oleju"),
-        T::IntakeAir => ("Intake air", "Pow. dolot"),
+        T::IntakeAir => ("Intake air", "Temp. dolotu"),
         T::Egt => ("EGT", "EGT"),
         T::Ignition2 => ("Ignition", "Zapłon"),
         T::Mbt => ("MBT", "MBT"),
         T::InjectorDuty => ("Inj. duty", "Wypełn. wtrysku"),
         T::FuelTrims => ("Trims ST/LT", "Korekty ST/LT"),
-        T::KnockRetard => ("Knock retard", "Cofnięcie stuku"),
+        T::KnockRetard => ("Knock retard", "Korekta stukowa"),
         T::Torque => ("Torque", "Moment"),
         T::Power => ("Power", "Moc"),
         T::Boost => ("Boost", "Doładowanie"),
-        T::TurboSpeed => ("Turbo speed", "Obroty turbo"),
+        T::TurboSpeed => ("Turbo", "Turbo"),
         T::Battery => ("Battery", "Akumulator"),
         T::FuelPressure => ("Fuel press.", "Ciśn. paliwa"),
         T::VehicleSpeed => ("Speed", "Prędkość"),
@@ -238,8 +246,8 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::OpenLoop => ("Open loop", "Pętla otwarta"),
         T::ChartSpeed => ("Engine speed [rpm]", "Prędkość obrotowa [obr/min]"),
         T::ChartManifold => ("Manifold pressure [kPa]", "Ciśnienie w kolektorze [kPa]"),
-        T::ChartMixture => ("Lambda (true / target)", "Lambda (rzeczywista / cel)"),
-        T::ChartSpark => ("Ignition / MBT [°BTDC]", "Zapłon / MBT [°przed GMP]"),
+        T::ChartMixture => ("Lambda", "Lambda"),
+        T::ChartSpark => ("Ignition [°BTDC]", "Zapłon [°przed GMP]"),
         T::Cylinders => ("Cylinders", "Cylindry"),
         T::Cylinder => ("Cyl.", "Cyl."),
         T::KnockLevel => ("Knock [bar]", "Stuk [bar]"),
@@ -247,6 +255,15 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::PeakPressure => ("Peak press. [bar]", "Ciśn. maks. [bar]"),
         T::PistonTemp => ("Piston [°C]", "Tłok [°C]"),
         T::Baro => ("Baro", "Baro"),
+        T::Throttle => ("Throttle", "Przepustnica"),
+        T::PedalShort => ("pedal", "pedał"),
+        T::LegendMeasured => ("measured", "zmierzona"),
+        T::LegendTarget => ("target", "cel"),
+        T::LegendSpark => ("ignition", "zapłon"),
+        T::SoakNeedsStop => (
+            "Switch the engine off first.",
+            "Najpierw wyłącz silnik.",
+        ),
         T::Table => ("Table", "Tablica"),
         T::MapVe => ("VE – volumetric efficiency [%]", "VE – sprawność napełniania [%]"),
         T::MapIgnition => ("Ignition advance [°BTDC]", "Wyprzedzenie zapłonu [°przed GMP]"),
@@ -266,23 +283,25 @@ pub fn tr(t: T, lang: Language) -> &'static str {
         T::AxisRpm => ("rpm", "obr/min"),
         T::AxisMap => ("MAP kPa", "MAP kPa"),
         T::AxisPedal => ("pedal %", "pedał %"),
-        T::Cells => ("cells", "komórek"),
+        T::ValueOutOfRange => ("value outside the allowed range", "wartość poza dopuszczalnym zakresem"),
         T::RunSweep => ("Run WOT power sweep", "Pomiar mocy (pełny gaz)"),
         T::Measuring => ("Measuring…", "Pomiar…"),
         T::CurrentRun => ("Current run", "Bieżący pomiar"),
         T::PreviousRun => ("Previous run", "Poprzedni pomiar"),
         T::DynoHelp => (
-            "The sweep runs on a copy of the engine with the current calibration, warmed up, at wide-open throttle, holding each speed for 4 s. Compare runs after every map change.",
-            "Pomiar odbywa się na kopii silnika z bieżącą kalibracją, rozgrzanej, przy pełnym gazie, z zatrzymaniem na 4 s w każdym punkcie. Porównuj pomiary po każdej zmianie map.",
+            "The sweep runs on a copy of the live engine (current calibration, fuel, faults and wear), warmed up, at wide-open throttle, holding each speed for 4 s. Compare runs after every map change.",
+            "Pomiar odbywa się na kopii bieżącego silnika (kalibracja, paliwo, usterki i zużycie), rozgrzanej, przy pełnym gazie, z zatrzymaniem na 4 s w każdym punkcie. Porównuj pomiary po każdej zmianie map.",
         ),
         T::PeakTorque => ("Peak torque", "Maks. moment"),
         T::PeakPower => ("Peak power", "Maks. moc"),
         T::DynoFailed => ("Engine failed during the sweep", "Silnik uległ awarii podczas pomiaru"),
         T::NoRunYet => ("No measurement yet", "Brak pomiaru"),
+        T::ColSpark => ("°BTDC", "°przed GMP"),
+        T::ColKnock => ("knock [bar]", "stuk [bar]"),
         T::NewCase => ("New case", "Nowy przypadek"),
         T::AutopsyHelp => (
-            "A hidden fault is planted in the engine. Drive it, read the gauges, trims, codes and the event log, then name the cause.",
-            "W silniku ukryto usterkę. Jedź, obserwuj zegary, korekty, kody i dziennik zdarzeń, a potem wskaż przyczynę.",
+            "'New case' plants a random hidden fault in the engine. Drive it, read the gauges, trims, codes and the event log, then name the cause.",
+            "„Nowy przypadek” ukrywa w silniku losową usterkę. Jedź, obserwuj zegary, korekty, kody i dziennik zdarzeń, a potem wskaż przyczynę.",
         ),
         T::CaseActive => ("A fault is hidden in the engine.", "W silniku ukryto usterkę."),
         T::NoCase => ("No active case.", "Brak aktywnego przypadku."),
@@ -303,5 +322,34 @@ pub fn tr(t: T, lang: Language) -> &'static str {
     match lang {
         Language::En => en,
         Language::Pl => pl,
+    }
+}
+
+/// "n cells" with the correct Polish plural form (1 komórka, 2–4 komórki, 5+ komórek).
+pub fn cells(n: usize, lang: Language) -> String {
+    let word = match lang {
+        Language::En if n == 1 => "cell",
+        Language::En => "cells",
+        Language::Pl if n == 1 => "komórka",
+        Language::Pl if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) => "komórki",
+        Language::Pl => "komórek",
+    };
+    format!("{n} {word}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polish_plural_of_cells() {
+        let pl = |n| cells(n, Language::Pl);
+        assert_eq!(pl(1), "1 komórka");
+        assert_eq!(pl(3), "3 komórki");
+        assert_eq!(pl(5), "5 komórek");
+        assert_eq!(pl(12), "12 komórek");
+        assert_eq!(pl(22), "22 komórki");
+        assert_eq!(pl(0), "0 komórek");
+        assert_eq!(cells(1, Language::En), "1 cell");
     }
 }
