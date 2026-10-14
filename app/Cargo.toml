@@ -1,0 +1,16 @@
+[package]
+name = "tunerlab-app"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "TunerLAB desktop application: live engine dashboard, calibration editor, dyno and Engine Autopsy"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[[bin]]
+name = "tunerlab"
+path = "src/main.rs"
+
+[dependencies]
+tunerlab = { path = ".." }
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }

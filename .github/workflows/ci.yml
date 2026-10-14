@@ -1,0 +1,95 @@
+# Continuous integration: formatting, lints and the full test suite on Linux and Windows,
+# plus the Windows build of the desktop app (`tunerlab.exe`) as a downloadable artifact.
+# A pushed tag `v*` also publishes that build as a GitHub release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a new stable release cannot turn fresh clippy lints into failures.
+  RUST_TOOLCHAIN: "1.97.0"
+
+jobs:
+  linux:
+    name: Lint and test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --release
+
+  windows:
+    name: Test and build tunerlab.exe (Windows)
+    runs-on: windows-latest
+    env:
+      # Static C runtime: the exe runs on a clean Windows without the VC++ redistributable.
+      RUSTFLAGS: "-C target-feature=+crt-static"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --workspace --release
+      - name: Build
+        run: cargo build --release -p tunerlab-app
+      - name: Check runtime dependencies
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("target/release/tunerlab.exe")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($text -match "(?i)vcruntime140") { throw "tunerlab.exe depends on the VC++ runtime" }
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/tunerlab.exe dist/
+          Copy-Item docs/INSTRUKCJA.md dist/
+          Copy-Item README.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunerlab-windows-x64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tunerlab-windows-x64
+          path: dist
+      - name: Zip
+        run: cd dist && zip -r ../tunerlab-windows-x64.zip .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: tunerlab-windows-x64.zip
+          generate_release_notes: true

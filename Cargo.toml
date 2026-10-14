@@ -1,0 +1,32 @@
+[package]
+name = "tunerlab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "TunerLAB - ECU calibration training simulator: real-time engine simulation core"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[lib]
+name = "tunerlab_core"
+path = "src/lib.rs"
+
+[dependencies]
+
+# The desktop application lives in its own crate so the simulation core stays
+# dependency-free (and usable from an audio thread or a headless test harness).
+[workspace]
+members = ["app"]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# The simulation integrates at 4 kHz; unoptimised test builds would make long
+# soak tests (warm-up, damage) needlessly slow.
+[profile.test]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1
