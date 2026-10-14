@@ -109,6 +109,8 @@ Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) �
 cargo run --release -p tunerlab-app
 ```
 
+Polish user guide with a 10-minute demo scenario: [`docs/INSTRUKCJA.md`](docs/INSTRUKCJA.md).
+
 * **Windows 10/11:** no extra dependencies (OpenGL 2+ driver).
 * **Linux:** an OpenGL driver (Mesa) and, on X11, `libxkbcommon-x11`
   (`sudo apt install libxkbcommon-x11-0 libgl1`); Wayland works out of the box.
