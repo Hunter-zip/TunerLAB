@@ -2,6 +2,7 @@
 
 > **TunerLAB** is a high-fidelity, interactive ECU Tuning Simulator and Educational Platform designed to bridge the gap between virtual engine calibration and real-world calibration engineering.
 
+[![CI](https://github.com/Hunter-zip/TunerLAB/actions/workflows/ci.yml/badge.svg)](https://github.com/Hunter-zip/TunerLAB/actions/workflows/ci.yml)
 ![Platforms](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-blue)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 ![GUI](https://img.shields.io/badge/GUI-egui-green)
@@ -109,6 +110,13 @@ Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) �
 ```bash
 cargo run --release -p tunerlab-app
 ```
+
+**Ready-made Windows build:** every CI run on `main` and on pull requests builds `tunerlab.exe`
+(static C runtime, no installation). Open
+[Actions → CI](https://github.com/Hunter-zip/TunerLAB/actions/workflows/ci.yml), pick the latest
+green run and download the `tunerlab-windows-x64` artifact (a zip with the exe and the guides).
+A pushed version tag (`v*`) publishes the same build under
+[Releases](https://github.com/Hunter-zip/TunerLAB/releases).
 
 Polish user guide with a 10-minute demo scenario: [`docs/INSTRUKCJA.md`](docs/INSTRUKCJA.md).
 

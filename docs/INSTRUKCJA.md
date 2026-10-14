@@ -2,7 +2,17 @@
 
 ## Uruchomienie
 
+**Gotowy plik dla Windows:** GitHub → zakładka
+[Actions → CI](https://github.com/Hunter-zip/TunerLAB/actions/workflows/ci.yml) → ostatnie
+zielone uruchomienie → sekcja *Artifacts* → `tunerlab-windows-x64` (zip z `tunerlab.exe`
+i instrukcjami). Po rozpakowaniu wystarczy uruchomić `tunerlab.exe`. Wersje oznaczone tagiem
+`v*` trafiają też do [Releases](https://github.com/Hunter-zip/TunerLAB/releases).
+
+**Ze źródeł** (Rust 1.95 lub nowszy):
+
 ```bash
+git clone https://github.com/Hunter-zip/TunerLAB.git
+cd TunerLAB
 cargo run --release -p tunerlab-app
 ```
 
