@@ -31,7 +31,7 @@ Ultimately, TunerLAB aims to recreate the structural behavior, datalogs, and use
 
 - [x] **Phase 1 (Current):** Core Simulation Engine (thermodynamic math loop & fail-safe architecture).
 - [ ] **Phase 2:** Procedural Audio Engine (low-latency waveform synthesis tracking live RPM/load changes).
-- [ ] **Phase 3:** Core UI Integration & bilingual multi-language support framework.
+- [~] **Phase 3:** Core UI Integration & bilingual multi-language support framework — first working desktop app (see below).
 - [ ] **Phase 4:** ECU Interface Emulation (WinOLS hex-matrix style, OEM tabbed-grid style, motorsport standalone gauge style).
 - [ ] **Phase 5:** Interactive Master Course (lessons, diagnostic tasks, Engine Autopsy crash logs, monetization).
 
@@ -84,10 +84,41 @@ println!("{}: {:.0} rpm, λ {:.2}", sim.status_text(Language::Pl), t.rpm, t.lamb
 
 ---
 
+## 🖥️ Desktop App — first working version
+
+`tunerlab-app` (crate in `app/`, binary `tunerlab`) wraps the simulation core in a
+motorsport-standalone style instrument cluster built with `egui`, fully in Polish and English:
+
+| Tab | What it does |
+|---|---|
+| **Dashboard / Pulpit** | Tachometer, MAP/boost, λ with target, coolant, oil temperature and pressure, turbo or road speed; torque, power, ignition vs MBT, knock retard, injector duty, fuel trims, IAT, EGT; 30 s charts of speed, MAP, λ and spark |
+| **Maps / Mapy** | Live VE, ignition, target-λ and (turbo) boost tables with heat-map colouring, range selection, ± step / set-value editing, restore-to-base, live operating-point marker; every edit is validated by the ECU before it is applied |
+| **Dyno / Hamownia** | Wide-open-throttle power sweep on a warmed-up copy of the engine with the current calibration, on a worker thread; torque/power curves compared with the previous run, full measurement table (λ, spark, MBT, MAP, EGT, knock) |
+| **Engine Autopsy** | Plants a random hidden fault (17 kinds, realistic severities); the student diagnoses it from gauges, trims, codes and the event log, then checks the answer |
+| **Event log / Dziennik** | Time-stamped status changes, warnings, trouble codes and damage |
+
+Side panels: driver controls (ignition, starter, pedal, free rev / dynamometer / vehicle with
+gears, clutch, brake and road grade, ambient temperature and pressure, fuel octane, electrical
+load, warm-up / cold-soak / repair / reset) and the live status (condition, warnings, stored
+codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause.
+
+Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) · **↑/↓** pedal ±5 % ·
+**0–6** gear · **C** clutch (hold) · **Space** brake (hold) · **+ / −** adjust the selected map cells.
+
+```bash
+cargo run --release -p tunerlab-app
+```
+
+* **Windows 10/11:** no extra dependencies (OpenGL 2+ driver).
+* **Linux:** an OpenGL driver (Mesa) and, on X11, `libxkbcommon-x11`
+  (`sudo apt install libxkbcommon-x11-0 libgl1`); Wayland works out of the box.
+
+---
+
 ## 🧑‍💻 Getting Started (For Developers)
 
 ### Prerequisites
-Latest stable Rust toolchain (1.80+):
+Latest stable Rust toolchain (core 1.80+, desktop app 1.95+):
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
@@ -96,7 +127,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```bash
 git clone https://github.com/Hunter-zip/TunerLAB.git
 cd TunerLAB
-cargo test                                             # unit, behaviour, zero-allocation and doc tests
+cargo test --workspace                                 # core (unit, behaviour, zero-allocation, doc) and app tests
+cargo run --release -p tunerlab-app                    # desktop app
 cargo run --release --example dyno_sweep               # NA dyno power curve
 cargo run --release --example dyno_sweep -- turbo pl   # turbo engine, Polish status texts
 ```

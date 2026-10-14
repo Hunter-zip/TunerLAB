@@ -13,6 +13,12 @@ path = "src/lib.rs"
 
 [dependencies]
 
+# The desktop application lives in its own crate so the simulation core stays
+# dependency-free (and usable from an audio thread or a headless test harness).
+[workspace]
+members = ["app"]
+resolver = "2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
