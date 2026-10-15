@@ -60,8 +60,10 @@ potwierdzasz przyciskiem *Dalej*; każdy krok można pominąć.
 1. **Zimny rozruch.** K, przytrzymaj S ok. 1 s. Obroty biegu jałowego ok. 1100/min, sonda
    lambda gotowa po kilkunastu sekundach, *Pętla otwarta* → *Pętla zamknięta* po rozgrzaniu.
    Przycisk **Rozgrzej** skraca czekanie.
-2. **Gaz.** Przytrzymaj W — silnik dochodzi do ogranicznika obrotów, pojawia się ostrzeżenie
-   o przekroczonych obrotach; po puszczeniu odcięcie paliwa (lambda skacze, wtrysk 0 ms).
+2. **Gaz.** Przytrzymaj W — silnik dochodzi do ogranicznika obrotów (odcięcie paliwa ok. 200 obr/min
+   nad czerwonym polem); po puszczeniu odcięcie paliwa na hamowaniu silnikiem (wtrysk 0 ms).
+   Ostrzeżenie o przekroczonych obrotach pojawi się dopiero, gdy podniesiesz ogranicznik w kalibracji
+   albo zredukujesz bieg przy zbyt wysokich obrotach.
 3. **Hamownia.** Zakładka *Hamownia* → *Pomiar mocy*: ok. 190 N·m / 107 kW (wolnossący).
 4. **Strojenie zapłonu.** *Mapy* → *Wyprzedzenie zapłonu*: zaznacz obszar 3200–5000 obr/min
    przy pełnym obciążeniu (88–105 kPa) i dodaj 4–6° (+). Ponowny pomiar na hamowni: moment

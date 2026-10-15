@@ -88,6 +88,20 @@ const MBT_REFRESH_S: f64 = 0.1;
 /// Time a knock or misfire indication is held for warnings \[s\].
 const WARNING_HOLD_S: f32 = 0.5;
 
+/// Engine speed above redline that the over-rev warning tolerates \[rpm\]. The factory
+/// limiter cuts 200 rpm above redline and the engine briefly overshoots the cut; the warning
+/// is for speeds beyond that band (a raised or disabled limiter, a missed downshift).
+const OVER_REV_MARGIN_RPM: f32 = 400.0;
+
+/// Fuelled-cycle λ below which the mixture counts as excessively rich.
+const RICH_LAMBDA: f32 = 0.7;
+
+/// Time the mixture must stay excessively rich before the warning shows \[s\]. A tip-out
+/// drives the fuelled λ rich for a moment as the port wall film evaporates into the falling
+/// manifold pressure (until the decel fuel cut engages); only a sustained rich mixture is a
+/// fault worth flagging.
+const RICH_PERSIST_S: f32 = 1.5;
+
 /// Errors returned by [`EngineSim`] constructors and setters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimError {
@@ -159,6 +173,8 @@ pub struct EngineSim {
     /// Last time each warning was active \[s\], for rate-limiting its log entries.
     warning_last_active: [f64; Warning::ALL.len()],
     misfire_hold: f32,
+    /// Time the fuelled-cycle λ has stayed below [`RICH_LAMBDA`] \[s\].
+    rich_s: f32,
     fired_prev: [bool; MAX_CYLINDERS],
     mbt_cache_deg: f32,
     mbt_cache_time: f64,
@@ -198,6 +214,7 @@ impl EngineSim {
             knock_hold: [0.0; MAX_CYLINDERS],
             warning_last_active: [f64::NEG_INFINITY; Warning::ALL.len()],
             misfire_hold: 0.0,
+            rich_s: 0.0,
             fired_prev: [false; MAX_CYLINDERS],
             mbt_cache_deg: 0.0,
             mbt_cache_time: f64::NEG_INFINITY,
@@ -317,6 +334,10 @@ impl EngineSim {
             *k = math::flush_tiny(*k * decay);
         }
         self.misfire_hold = (self.misfire_hold - dt).max(0.0);
+        let rich = self.condition == EngineCondition::Running
+            && !self.fuel_cut_active()
+            && self.plant.exhaust_lambda_fuelled < RICH_LAMBDA;
+        self.rich_s = if rich { self.rich_s + dt } else { 0.0 };
 
         let condition = self.evaluate_condition();
         if condition != self.condition {
@@ -360,6 +381,11 @@ impl EngineSim {
         }
     }
 
+    /// A commanded fuel cut is active, or its film-only cycles are still being flushed.
+    fn fuel_cut_active(&self) -> bool {
+        self.ecu.rev_cut || self.ecu.dfco || self.ecu.overboost_cut || self.ecu.cut_flush_hold > 0.0
+    }
+
     fn evaluate_warnings(&self) -> Warnings {
         let p = &self.plant;
         let lim = &self.spec.limits;
@@ -371,7 +397,10 @@ impl EngineSim {
             Warning::Knock,
             self.knock_hold[..n].iter().any(|k| *k > 1.0),
         );
-        w.set(Warning::OverRev, rpm > lim.redline_rpm);
+        w.set(
+            Warning::OverRev,
+            rpm > lim.redline_rpm + OVER_REV_MARGIN_RPM,
+        );
         w.set(Warning::ValveFloat, p.valve_float > 0.0);
         w.set(
             Warning::Overheat,
@@ -393,10 +422,7 @@ impl EngineSim {
         // The mixture warnings judge the λ the engine burns (fuelled cycles only), and stay
         // quiet during commanded fuel cuts, whose film-only cycles are lean by design, and
         // for the few cycles after one while the port wall film rebuilds.
-        let fuel_cut = self.ecu.rev_cut
-            || self.ecu.dfco
-            || self.ecu.overboost_cut
-            || self.ecu.cut_flush_hold > 0.0;
+        let fuel_cut = self.fuel_cut_active();
         w.set(
             Warning::LeanUnderLoad,
             running
@@ -407,7 +433,7 @@ impl EngineSim {
         );
         w.set(
             Warning::RichMixture,
-            running && !fuel_cut && p.exhaust_lambda_fuelled < 0.7,
+            running && self.rich_s >= RICH_PERSIST_S,
         );
         // Turbine wheels set the EGT ceiling on turbo engines, exhaust valves and the
         // catalyst on naturally aspirated ones.
@@ -666,6 +692,7 @@ impl EngineSim {
         }
         self.knock_hold = [0.0; MAX_CYLINDERS];
         self.misfire_hold = 0.0;
+        self.rich_s = 0.0;
         let condition = self.evaluate_condition();
         if condition != self.condition {
             self.condition = condition;
@@ -726,6 +753,7 @@ impl EngineSim {
         self.knock_hold = [0.0; MAX_CYLINDERS];
         self.warning_last_active = [f64::NEG_INFINITY; Warning::ALL.len()];
         self.misfire_hold = 0.0;
+        self.rich_s = 0.0;
         self.fired_prev = [false; MAX_CYLINDERS];
         self.mbt_cache_deg = 0.0;
         self.mbt_cache_time = f64::NEG_INFINITY;
