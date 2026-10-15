@@ -68,6 +68,8 @@ pub struct DynoBench {
     pub progress: f32,
     pub current: Option<DynoRun>,
     pub previous: Option<DynoRun>,
+    /// Sweeps finished since the bench was created (the course counts new measurements).
+    pub completed: u32,
 }
 
 impl DynoBench {
@@ -113,6 +115,7 @@ impl DynoBench {
                     }
                     self.progress = 1.0;
                     self.worker = None;
+                    self.completed += 1;
                     return;
                 }
                 Err(TryRecvError::Empty) => return,

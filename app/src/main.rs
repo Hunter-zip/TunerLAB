@@ -11,6 +11,7 @@
 
 mod app;
 mod autopsy;
+mod course;
 mod dyno;
 mod history;
 mod maps;

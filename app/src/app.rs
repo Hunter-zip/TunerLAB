@@ -7,11 +7,12 @@ use eframe::egui::{self, Color32, Key, RichText, Vec2};
 use tunerlab_core::engine_sim::events::{DiagnosticEvent, EventKind};
 use tunerlab_core::engine_sim::MAX_TICK_S;
 use tunerlab_core::{
-    DynoParams, EngineCondition, EngineSim, EngineSpec, FailureCause, Language, LoadModel,
-    Localize, VehicleParams, Warning,
+    Calibration, DynoParams, EngineCondition, EngineSim, EngineSpec, FailureCause, Language,
+    LoadModel, Localize, VehicleParams, Warning,
 };
 
 use crate::autopsy::{self, Autopsy, Verdict};
+use crate::course::{self, Course};
 use crate::dyno::DynoBench;
 use crate::history::{self, History, Readout, SAMPLES};
 use crate::maps::MapEditor;
@@ -42,8 +43,9 @@ impl Preset {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(crate) enum Tab {
     Dashboard,
+    Course,
     Maps,
     Dyno,
     Autopsy,
@@ -51,7 +53,7 @@ enum Tab {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoadKind {
+pub(crate) enum LoadKind {
     Neutral,
     Dyno,
     Vehicle,
@@ -122,6 +124,9 @@ pub struct TunerApp {
     maps: MapEditor,
     dyno: DynoBench,
     autopsy: Autopsy,
+    course: Course,
+    /// Base calibration of the current engine (the course compares map edits against it).
+    base_cal: Calibration,
 }
 
 impl TunerApp {
@@ -131,6 +136,7 @@ impl TunerApp {
         let sim = EngineSim::with_base_calibration(preset.spec(), SEED)
             .expect("built-in presets are valid");
         let event_cursor = sim.events().next_seq();
+        let base_cal = *sim.calibration();
         Self {
             lang: Language::Pl,
             preset,
@@ -149,6 +155,8 @@ impl TunerApp {
             maps: MapEditor::default(),
             dyno: DynoBench::default(),
             autopsy: Autopsy::default(),
+            course: Course::default(),
+            base_cal,
         }
     }
 
@@ -158,6 +166,7 @@ impl TunerApp {
         }
         if let Ok(sim) = EngineSim::with_base_calibration(preset.spec(), SEED) {
             self.preset = preset;
+            self.base_cal = *sim.calibration();
             self.sim = sim;
             // The new engine starts at the ambient set in the panel, not the default 25 °C.
             let (ambient_k, baro_pa) = (
@@ -366,11 +375,32 @@ impl eframe::App for TunerApp {
         self.history.record(self.sim.telemetry(), &readout);
         self.poll_events();
         self.dyno.poll();
+        let runs = self.dyno.completed;
+        let course_ctx = course::Ctx {
+            t: self.sim.telemetry(),
+            ignition: self.inputs.ignition,
+            cal: self.sim.calibration(),
+            base: &self.base_cal,
+            turbo: self.sim.spec().turbo.is_some(),
+            tab: self.tab,
+            map_kind: self.maps.kind,
+            load: self.inputs.load,
+            octane: self.inputs.octane,
+            new_runs: self.course.new_runs(runs),
+            case_open: self.autopsy.fault.is_some(),
+            case_closed: self.autopsy.fault.is_some()
+                && (self.autopsy.revealed || self.autopsy.verdict == Some(Verdict::Correct)),
+        };
+        self.course.update(&course_ctx, dt, runs);
         ctx.request_repaint();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.top_bar(ui);
+        if self.course.is_active() {
+            let (lang, runs) = (self.lang, self.dyno.completed);
+            egui::Panel::bottom("course").show(ui, |ui| self.course.strip_ui(ui, lang, runs));
+        }
         egui::Panel::left("controls")
             .resizable(false)
             .exact_size(280.0)
@@ -406,6 +436,12 @@ impl eframe::App for TunerApp {
                     .id_salt("autopsy")
                     .show(ui, |ui| self.autopsy_tab(ui));
             }
+            Tab::Course => {
+                let (lang, runs) = (self.lang, self.dyno.completed);
+                egui::ScrollArea::vertical()
+                    .id_salt("course")
+                    .show(ui, |ui| self.course.tab_ui(ui, lang, runs));
+            }
             Tab::Log => self.log_tab(ui),
         });
     }
@@ -432,6 +468,7 @@ impl TunerApp {
                 ui.separator();
                 for (tab, label) in [
                     (Tab::Dashboard, T::TabDashboard),
+                    (Tab::Course, T::TabCourse),
                     (Tab::Maps, T::TabMaps),
                     (Tab::Dyno, T::TabDyno),
                     (Tab::Autopsy, T::TabAutopsy),
