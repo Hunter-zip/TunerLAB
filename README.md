@@ -94,7 +94,7 @@ motorsport-standalone style instrument cluster built with `egui`, fully in Polis
 |---|---|
 | **Dashboard / Pulpit** | Tachometer, MAP, λ with target, coolant, oil temperature and pressure, turbo or road speed; torque, power, ignition (vs MBT in the instructor view), knock retard, injector duty, fuel trims, throttle and pedal, boost in bar (turbo), IAT, EGT, per-cylinder table; 30 s charts of speed, MAP, λ and spark. Shows the ECU's sensor readings by default; the *instructor (truth)* view adds physical truth and is locked during an Engine Autopsy case |
 | **Course / Kurs** | Six hands-on lessons (first start, VE map and fuel trims, ignition and knock, mixture under load, turbo boost, diagnostics); every step is checked automatically against the live simulation and the current task is shown in a strip at the bottom of every tab |
-| **Maps / Mapy** | Live VE, ignition, target-λ and (turbo) boost tables with heat-map colouring, range selection, ± step / set-value editing, restore-to-base, live operating-point marker; every edit is validated by the ECU before it is applied |
+| **Maps / Mapy** | Live VE, ignition, target-λ and (turbo) boost tables with heat-map colouring, range selection, ± step / set-value editing, restore-to-base, live operating-point marker; every edit is validated by the ECU before it is applied; map files (`.tlmap`, plain text) saved to and loaded from a `mapy` folder next to the program |
 | **Dyno / Hamownia** | Wide-open-throttle power sweep on a warmed-up copy of the live engine (calibration, fuel, hidden faults and wear included), on a worker thread; torque/power curves compared with the previous run, each labelled with engine and fuel, full measurement table (λ, spark, MBT, MAP, EGT, knock) |
 | **Engine Autopsy** | Plants a random hidden fault (17 kinds, realistic severities); the student diagnoses it from gauges, trims, codes and the event log, then checks the answer |
 | **Event log / Dziennik** | Time-stamped status changes, warnings, trouble codes and damage |
@@ -102,7 +102,9 @@ motorsport-standalone style instrument cluster built with `egui`, fully in Polis
 Side panels: driver controls (ignition, starter, pedal, free rev / dynamometer / vehicle with
 gears, clutch, brake and road grade, ambient temperature and pressure, fuel octane, electrical
 load, warm-up / cold-soak / repair / reset) and the live status (condition, warnings, stored
-codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause. The layout
+codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause. Procedural engine
+sound from the simulated combustion events (exhaust pulses, misfire gaps, knock ping, overrun pops,
+intake, turbo whistle, starter), with an on/off switch and volume in the top bar. The layout
 fits windows down to 1200 × 720 (tabs scroll when needed).
 
 Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) · **↑/↓** pedal ±5 % ·

@@ -25,12 +25,12 @@ cargo run --release -p tunerlab-app
 
 | Obszar | Zawartość |
 |---|---|
-| Górny pasek | wybór silnika (2.0 wolnossący / 2.0 turbo), zakładki, **Widok**: *Czujniki ECU* (to, co widzi datalogger) lub *Instruktor (prawda)* (rzeczywiste wartości fizyczne, MBT, ciśnienie w cylindrach), tempo symulacji 1×/2×/5×, pauza, język PL/EN |
+| Górny pasek | wybór silnika (2.0 wolnossący / 2.0 turbo), zakładki, **Widok**: *Czujniki ECU* (to, co widzi datalogger) lub *Instruktor (prawda)* (rzeczywiste wartości fizyczne, MBT, ciśnienie w cylindrach), tempo symulacji 1×/2×/5×, pauza, **dźwięk silnika** (włącz/wyłącz, głośność), język PL/EN |
 | Lewy panel | stacyjka, rozrusznik, pedał gazu, obciążenie: bez obciążenia / hamownia / samochód (bieg, sprzęgło, hamulec, nachylenie), otoczenie (temperatura, ciśnienie, paliwo RON, obciążenie elektryczne), warsztat (rozgrzej, wystudź, napraw, reset) |
 | Prawy panel | stan silnika, ostrzeżenia instruktora, zapisane kody usterek (DTC) z kasowaniem, stan podzespołów |
 | **Kurs** | 6 lekcji krok po kroku (pierwsze uruchomienie, mapa VE i korekty paliwa, zapłon i stuk, mieszanka pod obciążeniem, turbo i doładowanie, diagnostyka); każdy krok zalicza się automatycznie, gdy go wykonasz, a bieżące zadanie widać na pasku na dole każdej zakładki |
 | **Pulpit** | obrotomierz, MAP, lambda z wartością docelową, temperatury i ciśnienie oleju, kafelki (moment, moc, zapłon, korekta stukowa, wtrysk, korekty paliwa, przepustnica, doładowanie w barach…), tabela cylindrów, wykresy z 30 s |
-| **Mapy** | tablice VE, zapłonu, docelowej lambdy i (turbo) doładowania; zaznaczanie myszą, zmiana o krok (+/−), ustawianie wartości, przywracanie mapy bazowej; kropka pokazuje bieżący punkt pracy |
+| **Mapy** | tablice VE, zapłonu, docelowej lambdy i (turbo) doładowania; zaznaczanie myszą, zmiana o krok (+/−), ustawianie wartości, przywracanie mapy bazowej; kropka pokazuje bieżący punkt pracy; **Pliki map**: zapis i wczytanie wszystkich map do pliku `.tlmap` w folderze `mapy` obok programu |
 | **Hamownia** | pomiar mocy przy pełnym gazie na kopii bieżącego silnika (kalibracja, paliwo, ukryte usterki, zużycie); krzywe momentu i mocy porównane z poprzednim pomiarem, każdy opisany silnikiem i paliwem |
 | **Engine Autopsy** | ukryta usterka do zdiagnozowania (17 rodzajów) |
 | **Dziennik** | zdarzenia z czasem: zmiany stanu, ostrzeżenia, kody, uszkodzenia |
