@@ -10,7 +10,7 @@ use std::f32::consts::TAU;
 use tunerlab_core::engine_sim::events::CylinderEvent;
 
 /// Exhaust pulses and pops that can sound at once; when full, the quietest is replaced.
-pub const MAX_VOICES: usize = 64;
+pub const MAX_VOICES: usize = 256;
 /// Knock quieter than this is inaudible over the running engine \[bar\].
 pub const KNOCK_AUDIBLE_BAR: f32 = 0.3;
 /// Samples rendered per internal block.
@@ -293,6 +293,14 @@ impl HighPass {
     }
 }
 
+/// Sets a decayed state to exact zero: subnormal floats would otherwise linger in the
+/// filters and smoothers after the sound stops and make every sample slow to compute.
+fn flush(x: &mut f32) {
+    if x.abs() < 1e-20 {
+        *x = 0.0;
+    }
+}
+
 /// Smoothed copies of the continuous parameters.
 #[derive(Debug, Clone, Copy, Default)]
 struct Smoothed {
@@ -428,10 +436,14 @@ impl Synth {
         let slot = match self.voices.iter().position(|v| !v.active) {
             Some(free) => free,
             None => {
+                // Steal only a voice that is already sounding: overwriting a pending pulse
+                // would leave a gap in the firing rhythm that sounds like a misfire.
+                let clock = self.clock;
                 let quietest = self
                     .voices
                     .iter()
                     .enumerate()
+                    .filter(|(_, v)| v.start < clock)
                     .min_by(|a, b| a.1.loudness().total_cmp(&b.1.loudness()));
                 match quietest {
                     Some((i, _)) => i,
@@ -542,7 +554,40 @@ impl Synth {
         if broken {
             self.recover();
         }
+        self.flush_denormals();
         self.clock = end;
+    }
+
+    /// Zeroes decayed filter and smoother states (once per block).
+    fn flush_denormals(&mut self) {
+        let s = &mut self.s;
+        for x in [
+            &mut s.gain,
+            &mut s.throttle,
+            &mut s.hiss,
+            &mut s.whistle_amp,
+            &mut s.whistle_hz,
+            &mut s.starter_amp,
+            &mut s.starter_hz,
+            &mut s.compression_hz,
+        ] {
+            flush(x);
+        }
+        for f in [&mut self.muffler, &mut self.pop_lp, &mut self.hiss_bp]
+            .into_iter()
+            .chain(self.pipe.iter_mut())
+        {
+            flush(&mut f.z1);
+            flush(&mut f.z2);
+        }
+        for f in [&mut self.exhaust_dc, &mut self.pop_hp] {
+            flush(&mut f.x1);
+            flush(&mut f.y1);
+        }
+        for m in &mut self.ping_modes {
+            flush(&mut m.y1);
+            flush(&mut m.y2);
+        }
     }
 
     /// Clears every filter and voice after a non-finite sample, so one bad value cannot
@@ -574,6 +619,46 @@ mod tests {
     use super::*;
 
     const SR: f32 = 48_000.0;
+
+    #[test]
+    fn a_full_pool_never_overwrites_a_pending_pulse() {
+        let mut synth = Synth::new(SR);
+        // More pulses scheduled ahead than there are voices (5× speed at high rpm).
+        for i in 0..(MAX_VOICES + 40) as u64 {
+            synth.schedule(Note {
+                at: 4800 + 10 * i,
+                sound: Sound::Pulse {
+                    amp: 0.5 + 0.001 * i as f32,
+                    rpm: 6000.0,
+                },
+            });
+        }
+        let pending: Vec<u64> = synth
+            .voices
+            .iter()
+            .filter(|v| v.active)
+            .map(|v| v.start)
+            .collect();
+        assert_eq!(pending.len(), MAX_VOICES);
+        // The earliest pulses keep their voices; only the overflow is dropped.
+        assert!(pending.iter().all(|&at| at < 4800 + 10 * MAX_VOICES as u64));
+    }
+
+    #[test]
+    fn decayed_states_flush_to_zero_instead_of_staying_subnormal() {
+        let mut synth = Synth::new(SR);
+        synth.apply(Command::Params(loud()));
+        let mut out = vec![0.0; 4096];
+        synth.render(&mut out);
+        synth.apply(Command::Params(Params::default()));
+        for _ in 0..2000 {
+            synth.render(&mut out);
+        }
+        let s = synth.s;
+        for x in [s.gain, s.throttle, s.hiss, s.whistle_amp, s.starter_amp] {
+            assert!(x == 0.0 || x.is_normal(), "subnormal state {x:e}");
+        }
+    }
 
     fn loud() -> Params {
         Params {

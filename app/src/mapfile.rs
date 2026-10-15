@@ -39,6 +39,9 @@ const DIR_NAME: &str = "mapy";
 pub const EXTENSION: &str = "tlmap";
 /// Longest accepted file name (without the extension), in characters.
 const MAX_NAME_CHARS: usize = 64;
+/// Time after the overwrite question appears during which "Overwrite" stays disabled, so
+/// the second half of a double click on "Save" cannot confirm it unread \[s\].
+const CONFIRM_DELAY_S: f64 = 0.6;
 /// Longest piece of a bad line quoted back in an error message, in characters.
 const MAX_QUOTE_CHARS: usize = 24;
 
@@ -676,24 +679,25 @@ pub fn save_maps(
 ) -> Result<PathBuf, FileError> {
     fs::create_dir_all(dir).map_err(|e| io_error(Action::Save, &e))?;
     let path = file_path(dir, name);
-    let mut options = fs::OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
+    if !overwrite && path.exists() {
+        return Err(FileError::Exists {
+            file: name.to_owned(),
+        });
     }
-    let mut file = match options.open(&path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(FileError::Exists {
-                file: name.to_owned(),
-            })
-        }
-        Err(e) => return Err(io_error(Action::Save, &e)),
-    };
-    file.write_all(serialize(set).as_bytes())
-        .map_err(|e| io_error(Action::Save, &e))?;
+    // Write a temporary file and rename it over the target, so a failed write (full
+    // disk) never destroys the previous map or leaves a half-written one behind.
+    let tmp = dir.join(format!(".{name}.{EXTENSION}.tmp"));
+    let written = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(serialize(set).as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, &path));
+    if let Err(e) = written {
+        // Best effort: the temporary file is hidden and never listed anyway.
+        let _ = fs::remove_file(&tmp);
+        return Err(io_error(Action::Save, &e));
+    }
     Ok(path)
 }
 
@@ -759,6 +763,8 @@ pub struct MapFiles {
     scanned: bool,
     /// Name whose existing file the next save click replaces.
     confirm: Option<String>,
+    /// UI time at which the overwrite question appeared \[s\].
+    confirm_at: f64,
     status: Option<Status>,
 }
 
@@ -771,6 +777,7 @@ impl Default for MapFiles {
             chosen: None,
             scanned: false,
             confirm: None,
+            confirm_at: 0.0,
             status: None,
         }
     }
@@ -802,14 +809,16 @@ impl MapFiles {
             );
             let target = sanitize_name(&self.name);
             let confirmed = target.is_some() && self.confirm == target;
+            let now = ui.input(|i| i.time);
             let button = if confirmed {
                 egui::Button::new(RichText::new(l(lang, "Overwrite", "Nadpisz")).color(pal().warn))
             } else {
                 egui::Button::new(l(lang, "Save", "Zapisz"))
             };
+            let ready = !confirmed || now - self.confirm_at >= CONFIRM_DELAY_S;
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.add(button).clicked() || enter {
-                self.save(sim, target, confirmed);
+            if ui.add_enabled(ready, button).clicked() || (enter && ready) {
+                self.save(sim, target, confirmed, now);
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -879,7 +888,7 @@ impl MapFiles {
         }
     }
 
-    fn save(&mut self, sim: &EngineSim, target: Option<String>, overwrite: bool) {
+    fn save(&mut self, sim: &EngineSim, target: Option<String>, overwrite: bool, now: f64) {
         let Some(name) = target else {
             self.status = Some(Status::Failed(FileError::EmptyName));
             return;
@@ -895,6 +904,7 @@ impl MapFiles {
             }
             Err(e @ FileError::Exists { .. }) => {
                 self.confirm = Some(name);
+                self.confirm_at = now;
                 self.status = Some(Status::Failed(e));
             }
             Err(e) => {
@@ -911,8 +921,11 @@ impl MapFiles {
         self.confirm = None;
         match load_into(sim, &self.dir, &name) {
             Ok(()) => {
-                // Saving again goes to the same file (after the overwrite confirmation).
-                self.name = name.clone();
+                // Saving again goes to the same file (after the overwrite confirmation),
+                // when its name survives sanitizing unchanged.
+                if sanitize_name(&name).as_deref() == Some(name.as_str()) {
+                    self.name = name.clone();
+                }
                 self.status = Some(Status::Loaded(name));
                 true
             }
@@ -1325,7 +1338,7 @@ mod tests {
             ..MapFiles::default()
         };
         let mut sim = sim(false);
-        files.save(&sim, None, false);
+        files.save(&sim, None, false, 0.0);
         assert!(matches!(
             files.status,
             Some(Status::Failed(FileError::EmptyName))
@@ -1333,7 +1346,7 @@ mod tests {
 
         files.name = " my map ".into();
         let target = sanitize_name(&files.name);
-        files.save(&sim, target.clone(), false);
+        files.save(&sim, target.clone(), false, 0.0);
         assert!(matches!(files.status, Some(Status::Saved(_))));
         assert_eq!(files.name, "my_map");
         assert_eq!(files.chosen.as_deref(), Some("my_map"));
@@ -1342,7 +1355,7 @@ mod tests {
         // The first click on an existing name only asks; the second one writes.
         sim.update_calibration(|c| c.ignition.values[0][0] += 1.5)
             .unwrap();
-        files.save(&sim, target.clone(), false);
+        files.save(&sim, target.clone(), false, 0.0);
         assert_eq!(files.confirm, target);
         assert!(matches!(
             files.status,
@@ -1351,7 +1364,7 @@ mod tests {
         let mut fresh = self::sim(false);
         assert!(files.load(&mut fresh));
         assert_ne!(*fresh.calibration(), *sim.calibration());
-        files.save(&sim, target.clone(), true);
+        files.save(&sim, target.clone(), true, 1.0);
         assert_eq!(files.confirm, None);
         assert!(files.load(&mut fresh));
         assert_eq!(*fresh.calibration(), *sim.calibration());

@@ -126,8 +126,9 @@ A pushed version tag (`v*`) publishes the same build under
 Polish user guide with a 10-minute demo scenario: [`docs/INSTRUKCJA.md`](docs/INSTRUKCJA.md).
 
 * **Windows 10/11:** no extra dependencies (OpenGL 2+ driver).
-* **Linux:** an OpenGL driver (Mesa) and, on X11, `libxkbcommon-x11`
-  (`sudo apt install libxkbcommon-x11-0 libgl1`); Wayland works out of the box.
+* **Linux:** an OpenGL driver (Mesa), ALSA for the engine sound and, on X11, `libxkbcommon-x11`
+  (`sudo apt install libxkbcommon-x11-0 libgl1 libasound2`); building from source also needs
+  `sudo apt install libasound2-dev pkg-config`. Without an audio device the app runs silently.
 
 ---
 

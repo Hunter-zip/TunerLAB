@@ -12,6 +12,8 @@ mod output;
 mod synth;
 mod timeline;
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use tunerlab_core::{EngineCondition, EngineSim, Language};
 
@@ -23,6 +25,15 @@ use timeline::Timeline;
 const DEFAULT_VOLUME: f32 = 0.7;
 /// Width of the volume slider in the top bar \[px\].
 const SLIDER_W: f32 = 56.0;
+/// Longest frame interval the latency adapts to \[s\]; a longer gap is a stall, whose
+/// overdue notes are dropped instead of all sounding at once.
+const MAX_FRAME_S: f64 = 0.15;
+/// Per-frame decay of the frame-interval peak the latency follows.
+const PEAK_DECAY: f64 = 0.99;
+/// Safety margin added to the latency \[s\].
+const LATENCY_MARGIN_S: f64 = 0.01;
+/// Time between attempts to reopen a failed output device \[s\].
+const REOPEN_S: f32 = 1.0;
 
 /// Picks the string for the UI language.
 fn l(lang: Language, en: &'static str, pl: &'static str) -> &'static str {
@@ -40,6 +51,12 @@ pub struct EngineSound {
     cursor: u64,
     enabled: bool,
     volume: f32,
+    /// Wall-clock time of the previous `feed` call.
+    last_feed: Option<Instant>,
+    /// Recent peak of the interval between frames \[s\].
+    frame_peak_s: f64,
+    /// When to try reopening the output after the stream failed.
+    retry_at: Option<Instant>,
 }
 
 impl EngineSound {
@@ -56,6 +73,9 @@ impl EngineSound {
             cursor: 0,
             enabled: true,
             volume: DEFAULT_VOLUME,
+            last_feed: None,
+            frame_peak_s: 0.0,
+            retry_at: None,
         }
     }
 
@@ -81,6 +101,13 @@ impl EngineSound {
             self.timeline.reset();
         }
         let from = std::mem::replace(&mut self.cursor, ring.next_seq());
+        let now = Instant::now();
+        let frame_s = self
+            .last_feed
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+        self.last_feed = Some(now);
+        self.frame_peak_s = frame_s.min(MAX_FRAME_S).max(self.frame_peak_s * PEAK_DECAY);
+        self.recover_output(now);
         let Some(output) = self.output.as_ref().filter(|o| o.is_alive()) else {
             return;
         };
@@ -89,16 +116,42 @@ impl EngineSound {
         if !audible {
             return;
         }
-        // The latency must cover one output period plus a frame.
-        self.timeline.set_latency(2.0 * output.period_s() + 0.02);
+        // The latency must cover two output periods plus the longest recent frame, so a
+        // frame's events are still ahead of the audio clock when they arrive.
         self.timeline
-            .update(sim.time_s(), output.clock(), f64::from(speed));
+            .set_latency(2.0 * output.period_s() + self.frame_peak_s + LATENCY_MARGIN_S);
+        let clock = output.clock();
+        self.timeline.update(sim.time_s(), clock, f64::from(speed));
         for ev in ring.since(from) {
             for (sim_s, sound) in event_sounds(ev) {
-                if let Some(at) = self.timeline.sample_at(sim_s) {
+                // Overdue notes (after a stall) are dropped: played late they would all
+                // start on the same sample as one loud bang.
+                if let Some(at) = self.timeline.sample_at(sim_s).filter(|&at| at >= clock) {
                     output.send(Command::Note(Note { at, sound }));
                 }
             }
+        }
+    }
+
+    /// Drops a failed stream, which stops it so nothing keeps sounding, and reopens the
+    /// default device at most once per [`REOPEN_S`] (e.g. after the default output was
+    /// switched to a headset). Without a device at start-up there is nothing to retry.
+    fn recover_output(&mut self, now: Instant) {
+        let retry = Duration::from_secs_f32(REOPEN_S);
+        if self.output.as_ref().is_some_and(|o| !o.is_alive()) {
+            self.output = None;
+            self.retry_at = Some(now + retry);
+        }
+        if self.output.is_some() || self.retry_at.is_none_or(|at| now < at) {
+            return;
+        }
+        self.output = Output::open();
+        match &self.output {
+            Some(o) => {
+                self.timeline = Timeline::new(f64::from(o.sample_rate()));
+                self.retry_at = None;
+            }
+            None => self.retry_at = Some(now + retry),
         }
     }
 

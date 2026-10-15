@@ -84,7 +84,10 @@ impl Timeline {
                     }
                 };
                 let error = target - a.map(sim_now, sr);
-                if error.is_finite() && error.abs() <= RESYNC_S * sr {
+                // Re-anchor before slewing could map notes behind the audio clock: the
+                // window stays within half the latency.
+                let window = RESYNC_S.min(0.5 * self.latency_s) * sr;
+                if error.is_finite() && error.abs() <= window {
                     Anchor {
                         sample: a.sample + SLEW * error,
                         ..a

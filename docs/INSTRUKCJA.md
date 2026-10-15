@@ -18,8 +18,9 @@ cargo run --release -p tunerlab-app
 
 * **Windows 10/11:** gotowy plik `tunerlab.exe` nie wymaga instalacji ani dodatkowych bibliotek
   (potrzebny sterownik OpenGL 2+, obecny w każdym systemie z kartą graficzną).
-* **Linux:** sterownik OpenGL (Mesa) oraz w X11 `libxkbcommon-x11`
-  (`sudo apt install libxkbcommon-x11-0 libgl1`).
+* **Linux:** sterownik OpenGL (Mesa), ALSA do dźwięku silnika oraz w X11 `libxkbcommon-x11`
+  (`sudo apt install libxkbcommon-x11-0 libgl1 libasound2`); do kompilacji ze źródeł także
+  `sudo apt install libasound2-dev pkg-config`. Bez urządzenia audio program działa bez dźwięku.
 
 ## Ekran
 
