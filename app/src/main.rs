@@ -13,6 +13,7 @@ mod app;
 mod autopsy;
 mod dyno;
 mod history;
+mod mapfile;
 mod maps;
 mod text;
 mod widgets;
