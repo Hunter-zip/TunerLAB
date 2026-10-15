@@ -11,6 +11,7 @@ use tunerlab_core::{
     Localize, VehicleParams, Warning,
 };
 
+use crate::audio::EngineSound;
 use crate::autopsy::{self, Autopsy, Verdict};
 use crate::dyno::DynoBench;
 use crate::history::{self, History, Readout, SAMPLES};
@@ -96,8 +97,8 @@ impl Default for DriverInputs {
 const SEED: u64 = 2026;
 /// Diagnostic events kept for the log.
 const EVENT_HISTORY: usize = 300;
-/// Width the top bar keeps free for the clock, speed and language buttons \[px\].
-const SIM_CONTROLS_W: f32 = 360.0;
+/// Width the top bar keeps free for the clock, speed, sound and language controls \[px\].
+const SIM_CONTROLS_W: f32 = 500.0;
 /// Longest wall-clock step fed to the simulation (a stalled window must not jump) \[s\].
 const MAX_FRAME_S: f32 = 0.1;
 
@@ -122,6 +123,8 @@ pub struct TunerApp {
     maps: MapEditor,
     dyno: DynoBench,
     autopsy: Autopsy,
+    /// Procedural engine sound fed with the combustion events.
+    sound: EngineSound,
 }
 
 impl TunerApp {
@@ -149,6 +152,7 @@ impl TunerApp {
             maps: MapEditor::default(),
             dyno: DynoBench::default(),
             autopsy: Autopsy::default(),
+            sound: EngineSound::new(),
         }
     }
 
@@ -183,6 +187,7 @@ impl TunerApp {
     fn clear_log(&mut self) {
         self.events.clear();
         self.event_cursor = self.sim.events().next_seq();
+        self.sound.resync(&self.sim);
     }
 
     /// Writes the driver inputs (panel state plus held keys) into the simulation.
@@ -365,6 +370,7 @@ impl eframe::App for TunerApp {
         let readout = self.readout();
         self.history.record(self.sim.telemetry(), &readout);
         self.poll_events();
+        self.sound.feed(&self.sim, self.speed, self.paused);
         self.dyno.poll();
         ctx.request_repaint();
     }
@@ -487,6 +493,8 @@ impl TunerApp {
                     self.lang = l;
                 }
             }
+            ui.separator();
+            self.sound.controls(ui, lang);
             ui.separator();
             for s in [5.0_f32, 2.0, 1.0] {
                 if ui

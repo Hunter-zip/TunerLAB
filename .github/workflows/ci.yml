@@ -32,6 +32,9 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
+      - name: System libraries
+        # ALSA headers for the engine sound output (cpal).
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check

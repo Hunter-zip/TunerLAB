@@ -14,3 +14,5 @@ path = "src/main.rs"
 [dependencies]
 tunerlab = { path = ".." }
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Audio output for the procedural engine sound (ALSA on Linux: needs libasound2-dev to build).
+cpal = "0.18"
