@@ -28,6 +28,8 @@ const PARAM_TAU_S: f32 = 0.03;
 const GAIN_TAU_S: f32 = 0.04;
 /// Level of the summed buses before the soft clipper.
 const MASTER_LEVEL: f32 = 1.6;
+/// Make-up gain of the low-passed rumble noise.
+const RUMBLE_GAIN: f32 = 10.0;
 /// Knock ping partials: chamber resonance modes of an ≈ 86 mm bore \[Hz\], decay \[s\], weight.
 const PING_MODES: [(f32, f32, f32); 3] = [
     (6300.0, 0.007, 1.0),
@@ -312,6 +314,8 @@ struct Smoothed {
     starter_amp: f32,
     starter_hz: f32,
     compression_hz: f32,
+    rumble: f32,
+    firing_hz: f32,
 }
 
 /// The synthesizer. Its clock counts rendered samples from 0.
@@ -338,6 +342,9 @@ pub struct Synth {
     pop_lp: Biquad,
     ping_modes: [Resonator; 3],
     hiss_bp: Biquad,
+    /// Low-passed noise of the running engine's block and valvetrain.
+    rumble_lp: Biquad,
+    firing_phase: f32,
 }
 
 impl Synth {
@@ -364,13 +371,15 @@ impl Synth {
             exhaust_dc: HighPass::new(sr, 25.0),
             muffler: Biquad::lowpass(sr, 600.0, 0.7),
             pipe: [
-                Biquad::bandpass(sr, 85.0, 2.5),
+                Biquad::bandpass(sr, 85.0, 5.0),
                 Biquad::bandpass(sr, 260.0, 4.0),
             ],
             pop_hp: HighPass::new(sr, 400.0),
             pop_lp: Biquad::lowpass(sr, 6000.0, 0.7),
             ping_modes: PING_MODES.map(|(hz, tau, _)| Resonator::new(sr, hz, tau)),
             hiss_bp: Biquad::bandpass(sr, 2500.0, 0.8),
+            rumble_lp: Biquad::lowpass(sr, 160.0, 0.7),
+            firing_phase: 0.0,
         }
     }
 
@@ -411,8 +420,10 @@ impl Synth {
         let ms = |t: f32| (-1.0 / (t * 0.001 * self.sr)).exp();
         let (bus, amp, att, att_k, dec_k) = match note.sound {
             Sound::Pulse { amp, rpm } => {
-                // Blow-down lasts ≈ 60° of crank: shorter pulses at higher speed.
-                let tau_ms = (3000.0 / rpm.max(1.0)).clamp(0.7, 4.0);
+                // The blow-down itself lasts ≈ 60° of crank, but the exhaust system rings on
+                // for much of the firing interval; at idle a short pulse would leave audible
+                // gaps between the firings.
+                let tau_ms = (12_000.0 / rpm.max(1.0)).clamp(1.0, 14.0);
                 (Bus::Exhaust, amp, 1.0, ms(0.3), ms(tau_ms))
             }
             Sound::Pop { amp } => (Bus::Pop, amp, 1.0, ms(0.1), ms(4.0)),
@@ -499,6 +510,15 @@ impl Synth {
         let starter_amp = if t.cranking { 0.12 } else { 0.0 };
         let starter_hz = 40.0 + 0.8 * crank_rpm;
         let compression_hz = f32::from(t.cylinders.max(1)) * crank_rpm / 120.0;
+        // A running engine is never silent between firings: a low mechanical rumble that
+        // pulses with the firing frequency fills the gaps.
+        let running = t.rpm > 300.0 && !t.cranking;
+        let rumble = if running {
+            0.08 + 0.05 * t.throttle
+        } else {
+            0.0
+        };
+        let firing_hz = f32::from(t.cylinders.max(1)) * t.rpm.min(9000.0) / 120.0;
         self.muffler
             .set_lowpass(self.sr, 500.0 + 1000.0 * s.throttle, 0.7);
 
@@ -518,6 +538,8 @@ impl Synth {
             s.starter_amp += (starter_amp - s.starter_amp) * k;
             s.starter_hz += (starter_hz - s.starter_hz) * k;
             s.compression_hz += (compression_hz - s.compression_hz) * k;
+            s.rumble += (rumble - s.rumble) * k;
+            s.firing_hz += (firing_hz - s.firing_hz) * k;
 
             let e = self.exhaust_dc.process(exhaust[i] + 0.4 * pop[i]);
             let body = 1.2 * self.muffler.process(e)
@@ -529,6 +551,15 @@ impl Synth {
                 knock += w * m.process(ping[i]);
             }
             let hiss = s.hiss * self.hiss_bp.process(self.noise.next());
+            let mut rumble = 0.0;
+            if s.rumble > 1e-5 {
+                let f = wrap(&mut self.firing_phase, s.firing_hz);
+                // The 160 Hz low-pass keeps ≈ 1/10 of white noise's amplitude: scale it back.
+                rumble = s.rumble
+                    * (0.6 + 0.4 * f.sin())
+                    * RUMBLE_GAIN
+                    * self.rumble_lp.process(self.noise.next());
+            }
             let whistle = s.whistle_amp * wrap(&mut self.whistle_phase, s.whistle_hz).sin();
             let mut starter = 0.0;
             if s.starter_amp > 1e-5 {
@@ -540,7 +571,7 @@ impl Synth {
                     p.sin() + 0.45 * (2.0 * p).sin() + 0.25 * (3.0 * p).sin() + 0.2 * g.sin();
                 starter = s.starter_amp * (0.6 + 0.4 * c.sin()) * tone;
             }
-            let mix = (body + 0.8 * crack + 0.5 * knock + hiss + whistle + starter)
+            let mix = (body + 0.8 * crack + 0.5 * knock + hiss + whistle + starter + rumble)
                 * MASTER_LEVEL
                 * s.gain;
             let v = mix.tanh().clamp(-1.0, 1.0);
@@ -570,12 +601,19 @@ impl Synth {
             &mut s.starter_amp,
             &mut s.starter_hz,
             &mut s.compression_hz,
+            &mut s.rumble,
+            &mut s.firing_hz,
         ] {
             flush(x);
         }
-        for f in [&mut self.muffler, &mut self.pop_lp, &mut self.hiss_bp]
-            .into_iter()
-            .chain(self.pipe.iter_mut())
+        for f in [
+            &mut self.muffler,
+            &mut self.pop_lp,
+            &mut self.hiss_bp,
+            &mut self.rumble_lp,
+        ]
+        .into_iter()
+        .chain(self.pipe.iter_mut())
         {
             flush(&mut f.z1);
             flush(&mut f.z2);
@@ -604,6 +642,7 @@ impl Synth {
             m.clear();
         }
         self.hiss_bp.clear();
+        self.rumble_lp.clear();
         for v in &mut self.voices {
             v.active = false;
         }
@@ -849,8 +888,9 @@ mod tests {
             sound: pulse,
         });
         assert!(energy(&render(&mut synth, 960)) > 1e-4);
-        render(&mut synth, 9600);
-        // 1 s late: dropped (only the filter tail of the first pulse remains).
+        // Let the exhaust ring of the first pulse die away.
+        render(&mut synth, 48_000);
+        // 1 s late: dropped.
         synth.schedule(Note {
             at: 100,
             sound: pulse,

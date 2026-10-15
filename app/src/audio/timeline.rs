@@ -8,7 +8,7 @@
 
 /// Default distance of "now" ahead of the rendered audio \[s\]; must cover one frame plus
 /// one output buffer.
-pub const LATENCY_S: f64 = 0.07;
+pub const LATENCY_S: f64 = 0.1;
 /// A mapping error larger than this re-anchors the timeline instead of slewing it \[s\].
 const RESYNC_S: f64 = 0.15;
 /// Fraction of the mapping error corrected per frame (≈ 0.3 s time constant at 60 fps).
@@ -155,6 +155,106 @@ mod tests {
             assert!(offset.abs() < 512.0, "frame {frame}: offset {offset}");
             assert!((offset - previous).abs() < 40.0, "frame {frame}: jump");
             previous = offset;
+        }
+    }
+
+    /// Statistics of a simulated session: notes that landed behind the audio clock and the
+    /// worst deviation of the pulse spacing from the ideal \[samples\].
+    #[derive(Debug, Default)]
+    struct Stats {
+        notes: usize,
+        late: usize,
+        worst_late: f64,
+        worst_spacing_error: f64,
+    }
+
+    /// Plays 20 s of 100 Hz pulses through the timeline the way `EngineSound::feed` does:
+    /// UI frames of `frame_s` with `frame_jitter_s` of jitter and a `spike_s` frame every
+    /// `spike_every` frames; audio callbacks rendering `period` samples every `period`
+    /// (± `callback_jitter_s`).
+    fn session(
+        frame_s: f64,
+        frame_jitter_s: f64,
+        spike_s: f64,
+        spike_every: u64,
+        period: u64,
+        callback_jitter_s: f64,
+    ) -> Stats {
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut rand = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
+        };
+        let period_s = period as f64 / SR;
+        let mut tl = Timeline::new(SR);
+        let (mut wall, mut sim, mut clock) = (0.0_f64, 0.0_f64, 0u64);
+        let mut next_callback = period_s;
+        let mut next_event = 0.0_f64;
+        let mut peak = 0.0_f64;
+        let mut last_at: Option<u64> = None;
+        let mut stats = Stats::default();
+        let mut frame = 0u64;
+        while wall < 20.0 {
+            frame += 1;
+            let dt = if frame.is_multiple_of(spike_every) {
+                spike_s
+            } else {
+                frame_s + frame_jitter_s * rand()
+            };
+            wall += dt;
+            sim += dt.min(0.1);
+            while next_callback <= wall {
+                clock += period;
+                next_callback += period_s + callback_jitter_s * rand();
+            }
+            peak = dt.min(0.15).max(peak * 0.99);
+            tl.set_latency(2.0 * period_s + peak + 0.01);
+            tl.update(sim, clock, 1.0);
+            while next_event <= sim {
+                if let Some(at) = tl.sample_at(next_event) {
+                    stats.notes += 1;
+                    if at < clock {
+                        stats.late += 1;
+                        stats.worst_late = stats.worst_late.max((clock - at) as f64);
+                    }
+                    if let Some(prev) = last_at {
+                        let spacing = at as f64 - prev as f64;
+                        stats.worst_spacing_error =
+                            stats.worst_spacing_error.max((spacing - 480.0).abs());
+                    }
+                    last_at = Some(at);
+                }
+                next_event += 0.01;
+            }
+        }
+        stats
+    }
+
+    #[test]
+    fn jittery_frames_and_callbacks_keep_the_firing_rhythm() {
+        let cases = [
+            // 60 fps, WASAPI-like 10 ms periods.
+            (
+                "60 fps, 10 ms",
+                session(1.0 / 60.0, 0.004, 0.035, 90, 480, 0.002),
+            ),
+            // Busy GUI: 30 fps with 60 ms hiccups.
+            (
+                "30 fps, 10 ms",
+                session(1.0 / 30.0, 0.008, 0.06, 45, 480, 0.002),
+            ),
+            // Bluetooth-like: 20 ms periods arriving irregularly.
+            (
+                "60 fps, 20 ms",
+                session(1.0 / 60.0, 0.004, 0.035, 90, 960, 0.006),
+            ),
+        ];
+        for (name, s) in cases {
+            eprintln!("{name}: {s:?}");
+            assert_eq!(s.late, 0, "{name}: {s:?}");
+            assert!(s.worst_spacing_error < 0.25 * 480.0, "{name}: {s:?}");
         }
     }
 

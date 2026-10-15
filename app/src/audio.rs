@@ -30,6 +30,8 @@ const SLIDER_W: f32 = 56.0;
 const MAX_FRAME_S: f64 = 0.15;
 /// Per-frame decay of the frame-interval peak the latency follows.
 const PEAK_DECAY: f64 = 0.99;
+/// Lateness up to which a note still plays (starting at once) \[s\].
+const LATE_TOLERANCE_S: f64 = 0.02;
 /// Safety margin added to the latency \[s\].
 const LATENCY_MARGIN_S: f64 = 0.01;
 /// Time between attempts to reopen a failed output device \[s\].
@@ -121,12 +123,17 @@ impl EngineSound {
         self.timeline
             .set_latency(2.0 * output.period_s() + self.frame_peak_s + LATENCY_MARGIN_S);
         let clock = output.clock();
+        let late_tolerance = (LATE_TOLERANCE_S * f64::from(output.sample_rate())) as u64;
         self.timeline.update(sim.time_s(), clock, f64::from(speed));
         for ev in ring.since(from) {
             for (sim_s, sound) in event_sounds(ev) {
-                // Overdue notes (after a stall) are dropped: played late they would all
-                // start on the same sample as one loud bang.
-                if let Some(at) = self.timeline.sample_at(sim_s).filter(|&at| at >= clock) {
+                // A note a little late starts at once; notes overdue after a stall are
+                // dropped: played late they would all start on one sample as a loud bang.
+                if let Some(at) = self
+                    .timeline
+                    .sample_at(sim_s)
+                    .filter(|&at| at + late_tolerance >= clock)
+                {
                     output.send(Command::Note(Note { at, sound }));
                 }
             }

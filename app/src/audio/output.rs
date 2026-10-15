@@ -16,9 +16,10 @@ use super::synth::{Command, Synth};
 
 /// Commands the channel holds; at 5× speed one frame brings well under a hundred.
 const QUEUE: usize = 1024;
-/// Output periods per second requested from the driver: 10 ms periods (coarse periods would
-/// make the audio clock advance in large steps).
-const PERIODS_PER_S: u32 = 100;
+/// Output periods per second requested when the driver's own buffer size is refused: 20 ms.
+/// The driver default comes first: a forced short buffer underruns (audible dropouts) on
+/// busy machines and on many Windows devices.
+const PERIODS_PER_S: u32 = 50;
 /// Samples rendered at once inside the callback.
 const CHUNK: usize = 512;
 
@@ -56,7 +57,7 @@ impl Output {
             }
             _ => None,
         };
-        for buffer in fixed.into_iter().chain([BufferSize::Default]) {
+        for buffer in [BufferSize::Default].into_iter().chain(fixed) {
             config.buffer_size = buffer;
             let built = match format {
                 SampleFormat::F32 => build::<f32>(&device, &config),
