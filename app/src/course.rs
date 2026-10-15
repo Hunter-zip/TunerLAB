@@ -696,7 +696,7 @@ impl Course {
                         "✔ Lesson complete! Pick the next one in the “Course” tab.",
                         "✔ Lekcja ukończona! Następną wybierzesz w zakładce „Kurs”.",
                     ))
-                    .color(OK)
+                    .color(pal().ok)
                     .strong(),
                 );
             }
@@ -712,7 +712,7 @@ impl Course {
                     a.lesson + 1,
                     pick(&lesson.title, lang)
                 ))
-                .color(ACCENT)
+                .color(pal().accent)
                 .strong(),
             );
             ui.label(
@@ -722,7 +722,7 @@ impl Course {
                     a.step + 1,
                     lesson.steps.len()
                 ))
-                .color(DIM),
+                .color(pal().dim),
             );
             ui.add(
                 egui::ProgressBar::new(a.step as f32 / lesson.steps.len() as f32)
@@ -731,13 +731,17 @@ impl Course {
             if self.flash_s > 0.0 {
                 ui.label(
                     RichText::new(l(lang, "✔ Step done", "✔ Krok zaliczony"))
-                        .color(OK)
+                        .color(pal().ok)
                         .strong(),
                 );
             }
         });
         ui.label(RichText::new(pick(&step.text, lang)).size(15.0).strong());
-        ui.label(RichText::new(pick(&step.hint, lang)).color(DIM).size(12.5));
+        ui.label(
+            RichText::new(pick(&step.hint, lang))
+                .color(pal().dim)
+                .size(12.5),
+        );
         ui.horizontal_wrapped(|ui| {
             if step.done.is_none() {
                 if ui
@@ -753,7 +757,7 @@ impl Course {
                         "The step completes itself when you do it.",
                         "Krok zaliczy się sam, gdy go wykonasz.",
                     ))
-                    .color(DIM)
+                    .color(pal().dim)
                     .size(12.0),
                 );
             }
@@ -781,7 +785,7 @@ impl Course {
                 "Each lesson is a series of short tasks on the live engine. A step is ticked off automatically as soon as you do it; the current step is shown at the bottom of every tab.",
                 "Każda lekcja to seria krótkich zadań na żywym silniku. Krok zalicza się automatycznie, gdy go wykonasz; bieżący krok widać na dole każdej zakładki.",
             ))
-            .color(DIM),
+            .color(pal().dim),
         );
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -790,9 +794,9 @@ impl Course {
                 let running = self.active.is_some_and(|a| a.lesson == i);
                 let text = format!("{mark}{}. {}", i + 1, pick(&lesson.title, lang));
                 let text = if running {
-                    RichText::new(text).color(ACCENT)
+                    RichText::new(text).color(pal().accent)
                 } else if self.completed[i] {
-                    RichText::new(text).color(OK)
+                    RichText::new(text).color(pal().ok)
                 } else {
                     RichText::new(text)
                 };
@@ -810,16 +814,21 @@ impl Course {
         let current = self.active.filter(|a| a.lesson == i).map(|a| a.step);
         for (k, step) in lesson.steps.iter().enumerate() {
             let (mark, color) = match current {
-                Some(c) if k < c => ("✔", OK),
-                Some(c) if k == c => ("▶", ACCENT),
-                None if self.completed[i] => ("✔", OK),
-                _ => ("•", DIM),
+                Some(c) if k < c => ("✔", pal().ok),
+                Some(c) if k == c => ("▶", pal().accent),
+                None if self.completed[i] => ("✔", pal().ok),
+                _ => ("•", pal().dim),
             };
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(mark).color(color).monospace());
                 ui.label(
-                    RichText::new(format!("{}. {}", k + 1, pick(&step.text, lang)))
-                        .color(if Some(k) == current { TEXT } else { DIM }),
+                    RichText::new(format!("{}. {}", k + 1, pick(&step.text, lang))).color(
+                        if Some(k) == current {
+                            pal().text
+                        } else {
+                            pal().dim
+                        },
+                    ),
                 );
             });
         }
@@ -842,7 +851,7 @@ impl Course {
                         l(lang, "In progress: lesson", "W toku: lekcja"),
                         a.lesson + 1
                     ))
-                    .color(DIM),
+                    .color(pal().dim),
                 );
             }
         });

@@ -18,7 +18,8 @@ use crate::dyno::DynoBench;
 use crate::history::{self, History, Readout, SAMPLES};
 use crate::maps::MapEditor;
 use crate::text::{tr, T};
-use crate::widgets::{self, palette::*, Gauge, Level, Series};
+use crate::widgets::palette::{pal, set_skin, skin, Skin};
+use crate::widgets::{self, Gauge, Level, Series};
 
 /// Engine presets the student can pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,13 +349,19 @@ struct KeyState {
     gear: Option<u8>,
 }
 
+/// Applies the active skin's palette to egui's own widgets.
 fn configure_style(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = PANEL;
-    visuals.window_fill = PANEL;
-    visuals.extreme_bg_color = BACKGROUND;
-    visuals.selection.bg_fill = ACCENT.gamma_multiply(0.6);
-    visuals.hyperlink_color = ACCENT;
+    let p = pal();
+    let mut visuals = if p.dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.panel_fill = p.panel;
+    visuals.window_fill = p.panel;
+    visuals.extreme_bg_color = p.background;
+    visuals.selection.bg_fill = p.accent.gamma_multiply(if p.dark { 0.6 } else { 0.35 });
+    visuals.hyperlink_color = p.accent;
     ctx.set_visuals(visuals);
 }
 
@@ -459,7 +466,12 @@ impl TunerApp {
         egui::Panel::top("top").show(ui, |ui| {
             let mut narrow = false;
             ui.horizontal(|ui| {
-                ui.label(RichText::new("TunerLAB").strong().size(20.0).color(ACCENT));
+                ui.label(
+                    RichText::new("TunerLAB")
+                        .strong()
+                        .size(20.0)
+                        .color(pal().accent),
+                );
                 ui.separator();
                 ui.label(tr(T::Engine, lang));
                 let mut preset = self.preset;
@@ -491,7 +503,7 @@ impl TunerApp {
                     }
                 }
                 ui.separator();
-                ui.label(RichText::new(tr(T::View, lang)).color(DIM));
+                ui.label(RichText::new(tr(T::View, lang)).color(pal().dim));
                 if ui
                     .selectable_label(!self.showing_truth(), tr(T::ViewEcu, lang))
                     .clicked()
@@ -548,12 +560,12 @@ impl TunerApp {
             {
                 self.paused = !self.paused;
             }
-            ui.label(RichText::new(tr(T::SimSpeed, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::SimSpeed, lang)).color(pal().dim));
             ui.separator();
             ui.label(
                 RichText::new(format!("{:.1} s", self.sim.time_s()))
                     .monospace()
-                    .color(DIM),
+                    .color(pal().dim),
             );
         });
     }
@@ -671,7 +683,25 @@ impl TunerApp {
             }
         });
         ui.add_space(8.0);
-        ui.label(RichText::new(tr(T::KeysHelp, lang)).size(11.0).color(DIM));
+        ui.label(RichText::new(tr(T::Appearance, lang)).strong());
+        ui.horizontal_wrapped(|ui| {
+            for (s, label) in [
+                (Skin::Motorsport, T::SkinMotorsport),
+                (Skin::Navy, T::SkinNavy),
+                (Skin::Light, T::SkinLight),
+            ] {
+                if ui.selectable_label(skin() == s, tr(label, lang)).clicked() {
+                    set_skin(s);
+                    configure_style(ui.ctx());
+                }
+            }
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(tr(T::KeysHelp, lang))
+                .size(11.0)
+                .color(pal().dim),
+        );
     }
 
     fn status_panel(&mut self, ui: &mut egui::Ui) {
@@ -679,10 +709,10 @@ impl TunerApp {
         let t = *self.sim.telemetry();
         ui.heading(tr(T::Status, lang));
         let color = match t.condition {
-            EngineCondition::Running => OK,
-            EngineCondition::Cranking => WARN,
-            EngineCondition::Failed(_) => DANGER,
-            _ => DIM,
+            EngineCondition::Running => pal().ok,
+            EngineCondition::Cranking => pal().warn,
+            EngineCondition::Failed(_) => pal().danger,
+            _ => pal().dim,
         };
         ui.label(
             RichText::new(self.sim.status_text(lang))
@@ -696,18 +726,20 @@ impl TunerApp {
             } else {
                 tr(T::OpenLoop, lang)
             })
-            .color(DIM),
+            .color(pal().dim),
         );
 
         ui.add_space(8.0);
         ui.label(RichText::new(tr(T::Warnings, lang)).strong());
         if t.warnings.is_empty() {
-            ui.label(RichText::new(tr(T::NoWarnings, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::NoWarnings, lang)).color(pal().dim));
         }
         for w in t.warnings.iter() {
             let color = match w {
-                Warning::CheckEngine | Warning::InjectorDutyHigh | Warning::RichMixture => WARN,
-                _ => DANGER,
+                Warning::CheckEngine | Warning::InjectorDutyHigh | Warning::RichMixture => {
+                    pal().warn
+                }
+                _ => pal().danger,
             };
             widgets::lamp(ui, w.localized(lang), color);
         }
@@ -720,11 +752,16 @@ impl TunerApp {
             }
         });
         if self.sim.dtcs().is_empty() {
-            ui.label(RichText::new(tr(T::NoDtcs, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::NoDtcs, lang)).color(pal().dim));
         }
         for code in self.sim.dtcs().iter() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(code.code()).monospace().color(WARN).strong());
+                ui.label(
+                    RichText::new(code.code())
+                        .monospace()
+                        .color(pal().warn)
+                        .strong(),
+                );
                 ui.label(code.localized(lang));
             });
         }
@@ -830,7 +867,7 @@ impl TunerApp {
                     let mut g = Gauge::new(tr(T::Manifold, lang), "kPa", 0.0, map_max, r.map_kpa)
                         .step(if turbo { 50.0 } else { 20.0 });
                     if turbo && t.boost_target_kpa > 0.0 {
-                        g = g.marker(t.boost_target_kpa, CYAN);
+                        g = g.marker(t.boost_target_kpa, pal().cyan);
                     }
                     widgets::round_gauge(ui, small, &g);
                     // No reading during fuel cut (the probe sees air); off-scale values pin
@@ -847,7 +884,7 @@ impl TunerApp {
                         .caution(0.6, 0.75)
                         .danger(1.1, 1.4);
                     if running {
-                        g = g.marker(t.lambda_target, CYAN);
+                        g = g.marker(t.lambda_target, pal().cyan);
                     }
                     widgets::round_gauge(ui, small, &g);
                     widgets::round_gauge(
@@ -1063,7 +1100,8 @@ impl TunerApp {
                 ui.label(RichText::new(tr(T::Cylinders, lang)).strong());
                 for c in 0..n {
                     ui.label(
-                        RichText::new(format!("{} {}", tr(T::Cylinder, lang), c + 1)).color(DIM),
+                        RichText::new(format!("{} {}", tr(T::Cylinder, lang), c + 1))
+                            .color(pal().dim),
                     );
                 }
                 ui.end_row();
@@ -1071,7 +1109,7 @@ impl TunerApp {
                     |ui: &mut egui::Ui,
                      label: &str,
                      values: &mut dyn Iterator<Item = (String, Color32)>| {
-                        ui.label(RichText::new(label).color(DIM));
+                        ui.label(RichText::new(label).color(pal().dim));
                         for (v, color) in values {
                             ui.label(RichText::new(v).monospace().color(color));
                         }
@@ -1080,38 +1118,47 @@ impl TunerApp {
                 row(
                     ui,
                     tr(T::KnockRetard, lang),
-                    &mut t.knock_retard_deg[..n]
-                        .iter()
-                        .map(|v| (format!("{v:.1}°"), if *v > 0.5 { WARN } else { TEXT })),
+                    &mut t.knock_retard_deg[..n].iter().map(|v| {
+                        (
+                            format!("{v:.1}°"),
+                            if *v > 0.5 { pal().warn } else { pal().text },
+                        )
+                    }),
                 );
                 row(
                     ui,
                     tr(T::Misfires, lang),
                     &mut t.misfire_count[..n]
                         .iter()
-                        .map(|v| (v.to_string(), if *v > 0 { WARN } else { TEXT })),
+                        .map(|v| (v.to_string(), if *v > 0 { pal().warn } else { pal().text })),
                 );
                 if truth {
                     row(
                         ui,
                         tr(T::KnockLevel, lang),
-                        &mut t.knock_intensity[..n]
-                            .iter()
-                            .map(|v| (format!("{v:.2}"), if *v > 0.5 { DANGER } else { TEXT })),
+                        &mut t.knock_intensity[..n].iter().map(|v| {
+                            (
+                                format!("{v:.2}"),
+                                if *v > 0.5 { pal().danger } else { pal().text },
+                            )
+                        }),
                     );
                     row(
                         ui,
                         tr(T::PeakPressure, lang),
                         &mut t.peak_pressure_bar[..n]
                             .iter()
-                            .map(|v| (format!("{v:.0}"), TEXT)),
+                            .map(|v| (format!("{v:.0}"), pal().text)),
                     );
                     row(
                         ui,
                         tr(T::PistonTemp, lang),
-                        &mut t.piston_temp_c[..n]
-                            .iter()
-                            .map(|v| (format!("{v:.0}"), if *v > 300.0 { WARN } else { TEXT })),
+                        &mut t.piston_temp_c[..n].iter().map(|v| {
+                            (
+                                format!("{v:.0}"),
+                                if *v > 300.0 { pal().warn } else { pal().text },
+                            )
+                        }),
                     );
                 }
             });
@@ -1138,7 +1185,7 @@ impl TunerApp {
                 (0.0, rpm_top),
                 &[Series {
                     values: &rpm,
-                    color: ACCENT,
+                    color: pal().accent,
                     label: "",
                 }],
             );
@@ -1150,7 +1197,7 @@ impl TunerApp {
                 (0.0, map_top),
                 &[Series {
                     values: &map,
-                    color: BLUE,
+                    color: pal().blue,
                     label: "",
                 }],
             );
@@ -1165,12 +1212,12 @@ impl TunerApp {
                 &[
                     Series {
                         values: &lam_t,
-                        color: CYAN,
+                        color: pal().cyan,
                         label: tr(T::LegendTarget, lang),
                     },
                     Series {
                         values: &lam,
-                        color: OK,
+                        color: pal().ok,
                         label: tr(T::LegendMeasured, lang),
                     },
                 ],
@@ -1184,12 +1231,12 @@ impl TunerApp {
                 &[
                     Series {
                         values: if truth { &mbt } else { &[] },
-                        color: VIOLET,
+                        color: pal().violet,
                         label: if truth { tr(T::Mbt, lang) } else { "" },
                     },
                     Series {
                         values: &spark,
-                        color: WARN,
+                        color: pal().warn,
                         label: tr(T::LegendSpark, lang),
                     },
                 ],
@@ -1203,7 +1250,7 @@ impl TunerApp {
 
     fn dyno_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
-        ui.label(RichText::new(tr(T::DynoHelp, lang)).color(DIM));
+        ui.label(RichText::new(tr(T::DynoHelp, lang)).color(pal().dim));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let running = self.dyno.running();
@@ -1231,7 +1278,7 @@ impl TunerApp {
         });
         ui.add_space(6.0);
         let Some(current) = self.dyno.current.clone() else {
-            ui.label(RichText::new(tr(T::NoRunYet, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::NoRunYet, lang)).color(pal().dim));
             return;
         };
         let previous = self.dyno.previous.clone();
@@ -1242,14 +1289,14 @@ impl TunerApp {
                     tr(T::DynoFailed, lang),
                     cause.localized(lang)
                 ))
-                .color(DANGER)
+                .color(pal().danger)
                 .strong(),
             );
         }
         // One line per run, labelled with the engine and fuel it was measured on.
         for (run, label, color) in [
-            (Some(&current), T::CurrentRun, ACCENT),
-            (previous.as_ref(), T::PreviousRun, DIM),
+            (Some(&current), T::CurrentRun, pal().accent),
+            (previous.as_ref(), T::PreviousRun, pal().dim),
         ] {
             let Some(run) = run else { continue };
             if let (Some(tq), Some(pw)) = (run.peak_torque(), run.peak_power()) {
@@ -1292,7 +1339,7 @@ impl TunerApp {
                     "EGT °C",
                     tr(T::ColKnock, lang),
                 ] {
-                    ui.label(RichText::new(h).color(DIM).monospace());
+                    ui.label(RichText::new(h).color(pal().dim).monospace());
                 }
                 ui.end_row();
                 for p in &current.points {
@@ -1306,7 +1353,7 @@ impl TunerApp {
                     ui.monospace(format!("{:.0}", p.egt_c));
                     let knock = RichText::new(format!("{:.2}", p.knock_bar)).monospace();
                     ui.label(if p.knock_bar > 0.5 {
-                        knock.color(DANGER)
+                        knock.color(pal().danger)
                     } else {
                         knock
                     });
@@ -1317,7 +1364,7 @@ impl TunerApp {
 
     fn autopsy_tab(&mut self, ui: &mut egui::Ui) {
         let lang = self.lang;
-        ui.label(RichText::new(tr(T::AutopsyHelp, lang)).color(DIM));
+        ui.label(RichText::new(tr(T::AutopsyHelp, lang)).color(pal().dim));
         ui.add_space(6.0);
         if ui
             .button(RichText::new(tr(T::NewCase, lang)).strong())
@@ -1331,7 +1378,11 @@ impl TunerApp {
             ui.label(tr(T::NoCase, lang));
             return;
         };
-        ui.label(RichText::new(tr(T::CaseActive, lang)).color(WARN).strong());
+        ui.label(
+            RichText::new(tr(T::CaseActive, lang))
+                .color(pal().warn)
+                .strong(),
+        );
         ui.add_space(6.0);
         ui.label(RichText::new(tr(T::YourDiagnosis, lang)).strong());
         let turbo = self.sim.spec().turbo.is_some();
@@ -1379,13 +1430,17 @@ impl TunerApp {
             Some(Verdict::Correct) => {
                 ui.label(
                     RichText::new(tr(T::Correct, lang))
-                        .color(OK)
+                        .color(pal().ok)
                         .size(18.0)
                         .strong(),
                 );
             }
             Some(Verdict::Wrong) => {
-                ui.label(RichText::new(tr(T::Wrong, lang)).color(DANGER).strong());
+                ui.label(
+                    RichText::new(tr(T::Wrong, lang))
+                        .color(pal().danger)
+                        .strong(),
+                );
             }
             None => {}
         }
@@ -1396,7 +1451,7 @@ impl TunerApp {
                     tr(T::Solution, lang),
                     autopsy::describe(&fault, lang)
                 ))
-                .color(CYAN),
+                .color(pal().cyan),
             );
         }
     }
@@ -1405,7 +1460,7 @@ impl TunerApp {
         let lang = self.lang;
         ui.heading(tr(T::EventLog, lang));
         if self.events.is_empty() {
-            ui.label(RichText::new(tr(T::NoEvents, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::NoEvents, lang)).color(pal().dim));
         }
         egui::ScrollArea::vertical()
             .stick_to_bottom(true)
@@ -1417,18 +1472,18 @@ impl TunerApp {
                         for ev in &self.events {
                             let (kind, text, color) = match ev.kind {
                                 EventKind::ConditionChanged(c) => {
-                                    (T::EventCondition, c.localized(lang).to_owned(), DIM)
+                                    (T::EventCondition, c.localized(lang).to_owned(), pal().dim)
                                 }
                                 EventKind::Warning(w) => {
-                                    (T::EventWarning, w.localized(lang).to_owned(), WARN)
+                                    (T::EventWarning, w.localized(lang).to_owned(), pal().warn)
                                 }
                                 EventKind::Dtc(d) => (
                                     T::EventDtc,
                                     format!("{} – {}", d.code(), d.localized(lang)),
-                                    WARN,
+                                    pal().warn,
                                 ),
                                 EventKind::Damage(f) => {
-                                    (T::EventDamage, f.localized(lang).to_owned(), DANGER)
+                                    (T::EventDamage, f.localized(lang).to_owned(), pal().danger)
                                 }
                             };
                             ui.monospace(format!("{:9.2} s", ev.time_s));
@@ -1456,11 +1511,11 @@ fn dyno_chart(
     let size = Vec2::new(width.max(320.0), 260.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, CornerRadius::same(4), FACE);
+    p.rect_filled(rect, CornerRadius::same(4), pal().face);
     p.rect_stroke(
         rect,
         CornerRadius::same(4),
-        Stroke::new(1.0, TRACK),
+        Stroke::new(1.0, pal().track),
         StrokeKind::Inside,
     );
     let plot = rect.shrink2(Vec2::new(52.0, 24.0));
@@ -1479,24 +1534,20 @@ fn dyno_chart(
     let to_x = |rpm: f32| plot.left() + plot.width() * ((rpm - x0) / (x1 - x0)).clamp(0.0, 1.0);
     for i in 0..=5 {
         let y = plot.bottom() - plot.height() * i as f32 / 5.0;
-        p.hline(
-            plot.x_range(),
-            y,
-            Stroke::new(1.0, Color32::from_rgb(38, 43, 53)),
-        );
+        p.hline(plot.x_range(), y, Stroke::new(1.0, pal().grid));
         p.text(
             Pos2::new(plot.left() - 6.0, y),
             Align2::RIGHT_CENTER,
             format!("{:.0}", tq_max * i as f32 / 5.0),
             FontId::monospace(10.0),
-            ACCENT,
+            pal().accent,
         );
         p.text(
             Pos2::new(plot.right() + 6.0, y),
             Align2::LEFT_CENTER,
             format!("{:.0}", pw_max * i as f32 / 5.0),
             FontId::monospace(10.0),
-            BLUE,
+            pal().blue,
         );
     }
     let mut rpm = 1000.0;
@@ -1506,7 +1557,7 @@ fn dyno_chart(
             Align2::CENTER_TOP,
             format!("{rpm:.0}"),
             FontId::monospace(10.0),
-            DIM,
+            pal().dim,
         );
         rpm += 1000.0;
     }
@@ -1515,14 +1566,14 @@ fn dyno_chart(
         Align2::LEFT_TOP,
         "N·m",
         FontId::proportional(12.0),
-        ACCENT,
+        pal().accent,
     );
     p.text(
         rect.right_top() + Vec2::new(-8.0, 4.0),
         Align2::RIGHT_TOP,
         "kW",
         FontId::proportional(12.0),
-        BLUE,
+        pal().blue,
     );
     for (k, run) in runs.iter().enumerate().rev() {
         let fade = if k == 0 { 1.0 } else { 0.35 };
@@ -1547,8 +1598,8 @@ fn dyno_chart(
             })
             .collect();
         if tq.len() >= 2 {
-            p.line(tq, Stroke::new(2.0, ACCENT.gamma_multiply(fade)));
-            p.line(pw, Stroke::new(2.0, BLUE.gamma_multiply(fade)));
+            p.line(tq, Stroke::new(2.0, pal().accent.gamma_multiply(fade)));
+            p.line(pw, Stroke::new(2.0, pal().blue.gamma_multiply(fade)));
         }
     }
 }

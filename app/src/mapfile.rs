@@ -730,7 +730,7 @@ impl Status {
         match self {
             Status::Saved(path) => (
                 format!("{} {}", l(lang, "Saved:", "Zapisano:"), path.display()),
-                OK,
+                pal().ok,
             ),
             Status::Loaded(name) => (
                 lf(
@@ -738,10 +738,10 @@ impl Status {
                     format!("Loaded “{name}” into the ECU."),
                     format!("Wczytano „{name}” do ECU."),
                 ),
-                OK,
+                pal().ok,
             ),
-            Status::Failed(e @ FileError::Exists { .. }) => (e.message(lang), WARN),
-            Status::Failed(e) => (e.message(lang), DANGER),
+            Status::Failed(e @ FileError::Exists { .. }) => (e.message(lang), pal().warn),
+            Status::Failed(e) => (e.message(lang), pal().danger),
         }
     }
 }
@@ -803,7 +803,7 @@ impl MapFiles {
             let target = sanitize_name(&self.name);
             let confirmed = target.is_some() && self.confirm == target;
             let button = if confirmed {
-                egui::Button::new(RichText::new(l(lang, "Overwrite", "Nadpisz")).color(WARN))
+                egui::Button::new(RichText::new(l(lang, "Overwrite", "Nadpisz")).color(pal().warn))
             } else {
                 egui::Button::new(l(lang, "Save", "Zapisz"))
             };
@@ -841,7 +841,7 @@ impl MapFiles {
                 l(lang, "Folder:", "Folder:"),
                 self.dir.display()
             ))
-            .color(DIM)
+            .color(pal().dim)
             .size(12.0),
         );
         ui.label(
@@ -850,7 +850,7 @@ impl MapFiles {
                 "Loading replaces the VE, ignition and target-lambda maps (and the boost target on a turbo engine) in the ECU.",
                 "Wczytanie zastępuje w ECU mapy VE, zapłonu i docelowej lambdy (a w silniku turbo także docelowe doładowanie).",
             ))
-            .color(DIM)
+            .color(pal().dim)
             .size(12.0),
         );
         if let Some(status) = &self.status {

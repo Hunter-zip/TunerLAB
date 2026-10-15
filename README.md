@@ -104,8 +104,10 @@ gears, clutch, brake and road grade, ambient temperature and pressure, fuel octa
 load, warm-up / cold-soak / repair / reset) and the live status (condition, warnings, stored
 codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause. Procedural engine
 sound from the simulated combustion events (exhaust pulses, misfire gaps, knock ping, overrun pops,
-intake, turbo whistle, starter), with an on/off switch and volume in the top bar. The layout
-fits windows down to 1200 × 720 (tabs scroll when needed).
+intake, turbo whistle, starter), with an on/off switch and volume in the top bar. Three skins —
+*Motorsport* (dark, standalone-ECU style), *Tuner laptop* (navy) and *Map editor* (light, for
+projectors) — switchable at run time. The layout fits windows down to 1200 × 720 (tabs scroll when
+needed).
 
 Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) · **↑/↓** pedal ±5 % ·
 **0–6** gear · **C** clutch (hold) · **Space** brake (hold) · **+ / −** adjust the selected map cells.
