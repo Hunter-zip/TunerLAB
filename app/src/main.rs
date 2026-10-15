@@ -15,6 +15,7 @@ mod autopsy;
 mod course;
 mod dyno;
 mod history;
+mod mapfile;
 mod maps;
 mod text;
 mod widgets;

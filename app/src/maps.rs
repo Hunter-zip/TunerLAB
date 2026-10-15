@@ -8,6 +8,7 @@ use eframe::egui::{
 use tunerlab_core::engine_sim::calibration::Table2D;
 use tunerlab_core::{Calibration, EngineSim, Language};
 
+use crate::mapfile::MapFiles;
 use crate::text::{cells, tr, T};
 use crate::widgets::{heat, palette::*};
 
@@ -188,6 +189,8 @@ pub struct MapEditor {
     set_value: f32,
     /// The last edit was rejected by the calibration validator.
     rejected: bool,
+    /// Saving and loading map files.
+    files: MapFiles,
 }
 
 impl Default for MapEditor {
@@ -198,6 +201,7 @@ impl Default for MapEditor {
             step: MapKind::Ve.default_step(),
             set_value: 0.0,
             rejected: false,
+            files: MapFiles::default(),
         }
     }
 }
@@ -242,6 +246,11 @@ impl MapEditor {
             }
         });
         ui.label(RichText::new(tr(T::MapHelp, lang)).color(DIM).size(12.0));
+        if self.files.show(ui, sim, lang) {
+            // The loaded tables replace what the selection pointed at.
+            self.selection = None;
+            self.rejected = false;
+        }
         ui.add_space(4.0);
 
         let kind = self.kind;
