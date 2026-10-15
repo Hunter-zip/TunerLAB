@@ -18,18 +18,20 @@ cargo run --release -p tunerlab-app
 
 * **Windows 10/11:** gotowy plik `tunerlab.exe` nie wymaga instalacji ani dodatkowych bibliotek
   (potrzebny sterownik OpenGL 2+, obecny w każdym systemie z kartą graficzną).
-* **Linux:** sterownik OpenGL (Mesa) oraz w X11 `libxkbcommon-x11`
-  (`sudo apt install libxkbcommon-x11-0 libgl1`).
+* **Linux:** sterownik OpenGL (Mesa), ALSA do dźwięku silnika oraz w X11 `libxkbcommon-x11`
+  (`sudo apt install libxkbcommon-x11-0 libgl1 libasound2`); do kompilacji ze źródeł także
+  `sudo apt install libasound2-dev pkg-config`. Bez urządzenia audio program działa bez dźwięku.
 
 ## Ekran
 
 | Obszar | Zawartość |
 |---|---|
-| Górny pasek | wybór silnika (2.0 wolnossący / 2.0 turbo), zakładki, **Widok**: *Czujniki ECU* (to, co widzi datalogger) lub *Instruktor (prawda)* (rzeczywiste wartości fizyczne, MBT, ciśnienie w cylindrach), tempo symulacji 1×/2×/5×, pauza, język PL/EN |
-| Lewy panel | stacyjka, rozrusznik, pedał gazu, obciążenie: bez obciążenia / hamownia / samochód (bieg, sprzęgło, hamulec, nachylenie), otoczenie (temperatura, ciśnienie, paliwo RON, obciążenie elektryczne), warsztat (rozgrzej, wystudź, napraw, reset) |
+| Górny pasek | wybór silnika (2.0 wolnossący / 2.0 turbo), zakładki, **Widok**: *Czujniki ECU* (to, co widzi datalogger) lub *Instruktor (prawda)* (rzeczywiste wartości fizyczne, MBT, ciśnienie w cylindrach), tempo symulacji 1×/2×/5×, pauza, **dźwięk silnika** (włącz/wyłącz, głośność), język PL/EN |
+| Lewy panel | stacyjka, rozrusznik, pedał gazu, obciążenie: bez obciążenia / hamownia / samochód (bieg, sprzęgło, hamulec, nachylenie), otoczenie (temperatura, ciśnienie, paliwo RON, obciążenie elektryczne), warsztat (rozgrzej, wystudź, napraw, reset), **wygląd**: trzy skórki — *Motorsport* (ciemna), *Laptop tunera* (granatowa), *Edytor map* (jasna, na rzutnik) |
 | Prawy panel | stan silnika, ostrzeżenia instruktora, zapisane kody usterek (DTC) z kasowaniem, stan podzespołów |
+| **Kurs** | 6 lekcji krok po kroku (pierwsze uruchomienie, mapa VE i korekty paliwa, zapłon i stuk, mieszanka pod obciążeniem, turbo i doładowanie, diagnostyka); każdy krok zalicza się automatycznie, gdy go wykonasz, a bieżące zadanie widać na pasku na dole każdej zakładki |
 | **Pulpit** | obrotomierz, MAP, lambda z wartością docelową, temperatury i ciśnienie oleju, kafelki (moment, moc, zapłon, korekta stukowa, wtrysk, korekty paliwa, przepustnica, doładowanie w barach…), tabela cylindrów, wykresy z 30 s |
-| **Mapy** | tablice VE, zapłonu, docelowej lambdy i (turbo) doładowania; zaznaczanie myszą, zmiana o krok (+/−), ustawianie wartości, przywracanie mapy bazowej; kropka pokazuje bieżący punkt pracy |
+| **Mapy** | tablice VE, zapłonu, docelowej lambdy i (turbo) doładowania; zaznaczanie myszą, zmiana o krok (+/−), ustawianie wartości, przywracanie mapy bazowej; kropka pokazuje bieżący punkt pracy; **Pliki map**: zapis i wczytanie wszystkich map do pliku `.tlmap` w folderze `mapy` obok programu |
 | **Hamownia** | pomiar mocy przy pełnym gazie na kopii bieżącego silnika (kalibracja, paliwo, ukryte usterki, zużycie); krzywe momentu i mocy porównane z poprzednim pomiarem, każdy opisany silnikiem i paliwem |
 | **Engine Autopsy** | ukryta usterka do zdiagnozowania (17 rodzajów) |
 | **Dziennik** | zdarzenia z czasem: zmiany stanu, ostrzeżenia, kody, uszkodzenia |
@@ -47,13 +49,22 @@ cargo run --release -p tunerlab-app
 | Spacja (przytrzymaj) | hamulec |
 | + / − | zmiana zaznaczonych komórek mapy o krok |
 
+## Kurs
+
+Zakładka **Kurs** → wybierz lekcję → *Rozpocznij lekcję*. Na dole okna pojawi się pasek z bieżącym
+zadaniem i podpowiedzią; krok zalicza się sam, gdy warunek jest spełniony przez chwilę (np. silnik
+pracuje, korekty paliwa przekroczyły +6 %, zrobiłeś nowy pomiar na hamowni). Kroki do przeczytania
+potwierdzasz przyciskiem *Dalej*; każdy krok można pominąć.
+
 ## Scenariusz demo (ok. 10 minut)
 
 1. **Zimny rozruch.** K, przytrzymaj S ok. 1 s. Obroty biegu jałowego ok. 1100/min, sonda
    lambda gotowa po kilkunastu sekundach, *Pętla otwarta* → *Pętla zamknięta* po rozgrzaniu.
    Przycisk **Rozgrzej** skraca czekanie.
-2. **Gaz.** Przytrzymaj W — silnik dochodzi do ogranicznika obrotów, pojawia się ostrzeżenie
-   o przekroczonych obrotach; po puszczeniu odcięcie paliwa (lambda skacze, wtrysk 0 ms).
+2. **Gaz.** Przytrzymaj W — silnik dochodzi do ogranicznika obrotów (odcięcie paliwa ok. 200 obr/min
+   nad czerwonym polem); po puszczeniu odcięcie paliwa na hamowaniu silnikiem (wtrysk 0 ms).
+   Ostrzeżenie o przekroczonych obrotach pojawi się dopiero, gdy podniesiesz ogranicznik w kalibracji
+   albo zredukujesz bieg przy zbyt wysokich obrotach.
 3. **Hamownia.** Zakładka *Hamownia* → *Pomiar mocy*: ok. 190 N·m / 107 kW (wolnossący).
 4. **Strojenie zapłonu.** *Mapy* → *Wyprzedzenie zapłonu*: zaznacz obszar 3200–5000 obr/min
    przy pełnym obciążeniu (88–105 kPa) i dodaj 4–6° (+). Ponowny pomiar na hamowni: moment

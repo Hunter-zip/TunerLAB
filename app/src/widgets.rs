@@ -5,23 +5,122 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 
-/// Colour palette of the motorsport-standalone skin.
+/// Colour palettes of the skins, switchable at run time.
 pub mod palette {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use eframe::egui::Color32;
 
-    pub const BACKGROUND: Color32 = Color32::from_rgb(14, 16, 20);
-    pub const PANEL: Color32 = Color32::from_rgb(22, 25, 31);
-    pub const FACE: Color32 = Color32::from_rgb(28, 32, 40);
-    pub const TRACK: Color32 = Color32::from_rgb(52, 58, 70);
-    pub const TEXT: Color32 = Color32::from_rgb(222, 226, 232);
-    pub const DIM: Color32 = Color32::from_rgb(130, 138, 150);
-    pub const ACCENT: Color32 = Color32::from_rgb(255, 122, 26);
-    pub const OK: Color32 = Color32::from_rgb(60, 200, 110);
-    pub const WARN: Color32 = Color32::from_rgb(255, 196, 0);
-    pub const DANGER: Color32 = Color32::from_rgb(235, 56, 56);
-    pub const BLUE: Color32 = Color32::from_rgb(70, 150, 255);
-    pub const CYAN: Color32 = Color32::from_rgb(60, 210, 220);
-    pub const VIOLET: Color32 = Color32::from_rgb(170, 120, 255);
+    /// Colours of one skin.
+    pub struct Palette {
+        pub background: Color32,
+        pub panel: Color32,
+        /// Gauge faces, tiles and chart backgrounds.
+        pub face: Color32,
+        /// Gauge tracks, borders and empty bars.
+        pub track: Color32,
+        /// Chart grid lines.
+        pub grid: Color32,
+        pub text: Color32,
+        pub dim: Color32,
+        pub accent: Color32,
+        pub ok: Color32,
+        pub warn: Color32,
+        pub danger: Color32,
+        pub blue: Color32,
+        pub cyan: Color32,
+        pub violet: Color32,
+        /// Built on egui's dark visuals (otherwise the light ones).
+        pub dark: bool,
+    }
+
+    /// Available skins.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Skin {
+        /// Dark motorsport standalone-ECU look, orange accents.
+        Motorsport,
+        /// Navy tuner-laptop look, blue accents.
+        Navy,
+        /// Light map-editor look for bright rooms and projectors.
+        Light,
+    }
+
+    impl Skin {
+        pub const ALL: [Skin; 3] = [Skin::Motorsport, Skin::Navy, Skin::Light];
+    }
+
+    const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
+        Color32::from_rgb(r, g, b)
+    }
+
+    static PALETTES: [Palette; 3] = [
+        Palette {
+            background: rgb(14, 16, 20),
+            panel: rgb(22, 25, 31),
+            face: rgb(28, 32, 40),
+            track: rgb(52, 58, 70),
+            grid: rgb(38, 43, 53),
+            text: rgb(222, 226, 232),
+            dim: rgb(130, 138, 150),
+            accent: rgb(255, 122, 26),
+            ok: rgb(60, 200, 110),
+            warn: rgb(255, 196, 0),
+            danger: rgb(235, 56, 56),
+            blue: rgb(70, 150, 255),
+            cyan: rgb(60, 210, 220),
+            violet: rgb(170, 120, 255),
+            dark: true,
+        },
+        Palette {
+            background: rgb(12, 18, 30),
+            panel: rgb(19, 27, 42),
+            face: rgb(25, 36, 55),
+            track: rgb(50, 66, 92),
+            grid: rgb(34, 47, 68),
+            text: rgb(226, 232, 242),
+            dim: rgb(134, 150, 175),
+            accent: rgb(45, 150, 255),
+            ok: rgb(70, 210, 130),
+            warn: rgb(255, 190, 50),
+            danger: rgb(240, 70, 80),
+            blue: rgb(120, 190, 255),
+            cyan: rgb(80, 225, 210),
+            violet: rgb(190, 140, 255),
+            dark: true,
+        },
+        Palette {
+            background: rgb(226, 230, 236),
+            panel: rgb(240, 242, 245),
+            face: rgb(252, 252, 253),
+            track: rgb(188, 195, 206),
+            grid: rgb(222, 226, 232),
+            text: rgb(24, 30, 40),
+            dim: rgb(96, 105, 120),
+            accent: rgb(0, 96, 200),
+            ok: rgb(16, 140, 70),
+            warn: rgb(196, 124, 0),
+            danger: rgb(204, 32, 40),
+            blue: rgb(30, 100, 220),
+            cyan: rgb(0, 138, 160),
+            violet: rgb(120, 60, 200),
+            dark: false,
+        },
+    ];
+
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+    /// Palette of the active skin.
+    pub fn pal() -> &'static Palette {
+        &PALETTES[CURRENT.load(Ordering::Relaxed).min(PALETTES.len() - 1)]
+    }
+
+    pub fn skin() -> Skin {
+        Skin::ALL[CURRENT.load(Ordering::Relaxed).min(Skin::ALL.len() - 1)]
+    }
+
+    pub fn set_skin(skin: Skin) {
+        CURRENT.store(skin as usize, Ordering::Relaxed);
+    }
 }
 
 use palette::*;
@@ -133,30 +232,30 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
     let p = ui.painter_at(rect);
     let c = rect.center();
     let r = diameter * 0.5 - 2.0;
-    p.circle_filled(c, r, FACE);
-    p.circle_stroke(c, r, Stroke::new(1.5, TRACK));
+    p.circle_filled(c, r, pal().face);
+    p.circle_stroke(c, r, Stroke::new(1.5, pal().track));
 
     let ring = r * 0.86;
     let width = (r * 0.07).max(3.0);
-    p.line(arc(c, ring, 0.0, 1.0), Stroke::new(width, TRACK));
+    p.line(arc(c, ring, 0.0, 1.0), Stroke::new(width, pal().track));
     if let Some((a, b)) = g.caution {
         p.line(
             arc(c, ring, g.fraction(a), g.fraction(b)),
-            Stroke::new(width, WARN),
+            Stroke::new(width, pal().warn),
         );
     }
     if let Some((a, b)) = g.danger {
         p.line(
             arc(c, ring, g.fraction(a), g.fraction(b)),
-            Stroke::new(width, DANGER),
+            Stroke::new(width, pal().danger),
         );
     }
     let state = if g.in_zone(g.danger) {
-        DANGER
+        pal().danger
     } else if g.in_zone(g.caution) {
-        WARN
+        pal().warn
     } else {
-        ACCENT
+        pal().accent
     };
     let fv = g.fraction(g.value);
     if fv > 0.0 {
@@ -176,7 +275,7 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
                     polar(c, ring - width * 0.5 - r * 0.02, f),
                     polar(c, ring - width * 0.5 - r * 0.11, f),
                 ],
-                Stroke::new(1.5, TEXT),
+                Stroke::new(1.5, pal().text),
             );
             if g.min + g.major_step * (i as f32 + 0.5) <= g.max + 1.0e-3 {
                 let fm = g.fraction(v + g.major_step * 0.5);
@@ -185,7 +284,7 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
                         polar(c, ring - width * 0.5 - r * 0.02, fm),
                         polar(c, ring - width * 0.5 - r * 0.06, fm),
                     ],
-                    Stroke::new(1.0, DIM),
+                    Stroke::new(1.0, pal().dim),
                 );
             }
             let shown = v / g.label_divisor;
@@ -199,7 +298,7 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
                 Align2::CENTER_CENTER,
                 text,
                 label_font.clone(),
-                DIM,
+                pal().dim,
             );
         }
     }
@@ -214,7 +313,7 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
     // Needle.
     let tip = polar(c, ring - width * 0.2, fv);
     p.line_segment([c, tip], Stroke::new((r * 0.035).max(2.0), state));
-    p.circle_filled(c, r * 0.07, TRACK);
+    p.circle_filled(c, r * 0.07, pal().track);
 
     let value = if g.value.is_finite() {
         format!("{:.*}", g.decimals, g.value)
@@ -226,14 +325,14 @@ pub fn round_gauge(ui: &mut egui::Ui, diameter: f32, g: &Gauge) {
         Align2::CENTER_CENTER,
         value,
         FontId::monospace((r * 0.24).clamp(12.0, 34.0)),
-        TEXT,
+        pal().text,
     );
     p.text(
         c + Vec2::new(0.0, r * 0.62),
         Align2::CENTER_CENTER,
         format!("{} {}", g.label, g.unit),
         FontId::proportional((r * 0.12).clamp(9.0, 14.0)),
-        DIM,
+        pal().dim,
     );
 }
 
@@ -249,10 +348,10 @@ pub enum Level {
 impl Level {
     fn color(self) -> Color32 {
         match self {
-            Level::Normal => TEXT,
-            Level::Caution => WARN,
-            Level::Danger => DANGER,
-            Level::Off => DIM,
+            Level::Normal => pal().text,
+            Level::Caution => pal().warn,
+            Level::Danger => pal().danger,
+            Level::Off => pal().dim,
         }
     }
 }
@@ -261,11 +360,11 @@ impl Level {
 pub fn tile(ui: &mut egui::Ui, size: Vec2, label: &str, value: &str, unit: &str, level: Level) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, CornerRadius::same(4), FACE);
+    p.rect_filled(rect, CornerRadius::same(4), pal().face);
     let border = match level {
-        Level::Danger => DANGER,
-        Level::Caution => WARN,
-        _ => TRACK,
+        Level::Danger => pal().danger,
+        Level::Caution => pal().warn,
+        _ => pal().track,
     };
     p.rect_stroke(
         rect,
@@ -278,18 +377,18 @@ pub fn tile(ui: &mut egui::Ui, size: Vec2, label: &str, value: &str, unit: &str,
         Align2::LEFT_TOP,
         label,
         FontId::proportional(12.0),
-        DIM,
+        pal().dim,
     );
     // The unit follows the value on its baseline; when both do not fit, the value font
     // shrinks so the two never overlap.
     let unit_font = FontId::proportional(12.0);
     let unit_w = p
-        .layout_no_wrap(unit.to_owned(), unit_font.clone(), DIM)
+        .layout_no_wrap(unit.to_owned(), unit_font.clone(), pal().dim)
         .size()
         .x;
     let mut value_size = (size.y * 0.42).clamp(12.0, 26.0);
     let value_w = p
-        .layout_no_wrap(value.to_owned(), FontId::monospace(value_size), TEXT)
+        .layout_no_wrap(value.to_owned(), FontId::monospace(value_size), pal().text)
         .size()
         .x;
     let room = size.x - 16.0 - 5.0 - unit_w;
@@ -310,7 +409,7 @@ pub fn tile(ui: &mut egui::Ui, size: Vec2, label: &str, value: &str, unit: &str,
         Align2::LEFT_BOTTOM,
         unit,
         unit_font,
-        DIM,
+        pal().dim,
     );
 }
 
@@ -332,15 +431,15 @@ pub fn health_bar(ui: &mut egui::Ui, width: f32, label: &str, value: f32) {
         Align2::LEFT_CENTER,
         label,
         FontId::proportional(12.0),
-        DIM,
+        pal().dim,
     );
-    p.rect_filled(bar, CornerRadius::same(2), TRACK);
+    p.rect_filled(bar, CornerRadius::same(2), pal().track);
     let color = if v > 0.8 {
-        OK
+        pal().ok
     } else if v > 0.4 {
-        WARN
+        pal().warn
     } else {
-        DANGER
+        pal().danger
     };
     p.rect_filled(
         Rect::from_min_size(bar.min, Vec2::new(bar.width() * v, bar.height())),
@@ -352,7 +451,7 @@ pub fn health_bar(ui: &mut egui::Ui, width: f32, label: &str, value: f32) {
         Align2::RIGHT_CENTER,
         format!("{:.0} %", v * 100.0),
         FontId::monospace(11.0),
-        TEXT,
+        pal().text,
     );
 }
 
@@ -374,11 +473,11 @@ pub fn chart(
 ) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, CornerRadius::same(4), FACE);
+    p.rect_filled(rect, CornerRadius::same(4), pal().face);
     p.rect_stroke(
         rect,
         CornerRadius::same(4),
-        Stroke::new(1.0, TRACK),
+        Stroke::new(1.0, pal().track),
         StrokeKind::Inside,
     );
     let plot = rect
@@ -389,11 +488,7 @@ pub fn chart(
     for i in 0..=4 {
         let v = y0 + span * i as f32 / 4.0;
         let y = plot.bottom() - plot.height() * i as f32 / 4.0;
-        p.hline(
-            plot.x_range(),
-            y,
-            Stroke::new(1.0, Color32::from_rgb(38, 43, 53)),
-        );
+        p.hline(plot.x_range(), y, Stroke::new(1.0, pal().grid));
         let text = if span >= 20.0 {
             format!("{v:.0}")
         } else if span >= 2.0 {
@@ -406,7 +501,7 @@ pub fn chart(
             Align2::RIGHT_CENTER,
             text,
             FontId::monospace(10.0),
-            DIM,
+            pal().dim,
         );
     }
     p.text(
@@ -414,7 +509,7 @@ pub fn chart(
         Align2::LEFT_TOP,
         title,
         FontId::proportional(12.0),
-        DIM,
+        pal().dim,
     );
     // Legend, right-aligned on the title row.
     let mut x = rect.right() - 8.0;
@@ -424,7 +519,7 @@ pub fn chart(
             Align2::RIGHT_TOP,
             s.label,
             FontId::proportional(11.0),
-            TEXT,
+            pal().text,
         );
         let swatch = Rect::from_center_size(
             Pos2::new(text.left() - 9.0, text.center().y),
@@ -493,6 +588,6 @@ pub fn lamp(ui: &mut egui::Ui, text: &str, color: Color32) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
         ui.painter().circle_filled(rect.center(), 5.0, color);
-        ui.label(egui::RichText::new(text).color(TEXT));
+        ui.label(egui::RichText::new(text).color(pal().text));
     });
 }

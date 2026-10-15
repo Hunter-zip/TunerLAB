@@ -93,7 +93,8 @@ motorsport-standalone style instrument cluster built with `egui`, fully in Polis
 | Tab | What it does |
 |---|---|
 | **Dashboard / Pulpit** | Tachometer, MAP, λ with target, coolant, oil temperature and pressure, turbo or road speed; torque, power, ignition (vs MBT in the instructor view), knock retard, injector duty, fuel trims, throttle and pedal, boost in bar (turbo), IAT, EGT, per-cylinder table; 30 s charts of speed, MAP, λ and spark. Shows the ECU's sensor readings by default; the *instructor (truth)* view adds physical truth and is locked during an Engine Autopsy case |
-| **Maps / Mapy** | Live VE, ignition, target-λ and (turbo) boost tables with heat-map colouring, range selection, ± step / set-value editing, restore-to-base, live operating-point marker; every edit is validated by the ECU before it is applied |
+| **Course / Kurs** | Six hands-on lessons (first start, VE map and fuel trims, ignition and knock, mixture under load, turbo boost, diagnostics); every step is checked automatically against the live simulation and the current task is shown in a strip at the bottom of every tab |
+| **Maps / Mapy** | Live VE, ignition, target-λ and (turbo) boost tables with heat-map colouring, range selection, ± step / set-value editing, restore-to-base, live operating-point marker; every edit is validated by the ECU before it is applied; map files (`.tlmap`, plain text) saved to and loaded from a `mapy` folder next to the program |
 | **Dyno / Hamownia** | Wide-open-throttle power sweep on a warmed-up copy of the live engine (calibration, fuel, hidden faults and wear included), on a worker thread; torque/power curves compared with the previous run, each labelled with engine and fuel, full measurement table (λ, spark, MBT, MAP, EGT, knock) |
 | **Engine Autopsy** | Plants a random hidden fault (17 kinds, realistic severities); the student diagnoses it from gauges, trims, codes and the event log, then checks the answer |
 | **Event log / Dziennik** | Time-stamped status changes, warnings, trouble codes and damage |
@@ -101,8 +102,12 @@ motorsport-standalone style instrument cluster built with `egui`, fully in Polis
 Side panels: driver controls (ignition, starter, pedal, free rev / dynamometer / vehicle with
 gears, clutch, brake and road grade, ambient temperature and pressure, fuel octane, electrical
 load, warm-up / cold-soak / repair / reset) and the live status (condition, warnings, stored
-codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause. The layout
-fits windows down to 1200 × 720 (tabs scroll when needed).
+codes with *clear codes*, component health). Simulation speed 1×/2×/5× or pause. Procedural engine
+sound from the simulated combustion events (exhaust pulses, misfire gaps, knock ping, overrun pops,
+intake, turbo whistle, starter), with an on/off switch and volume in the top bar. Three skins —
+*Motorsport* (dark, standalone-ECU style), *Tuner laptop* (navy) and *Map editor* (light, for
+projectors) — switchable at run time. The layout fits windows down to 1200 × 720 (tabs scroll when
+needed).
 
 Keyboard: **K** ignition · **S** starter (hold) · **W** full throttle (hold) · **↑/↓** pedal ±5 % ·
 **0–6** gear · **C** clutch (hold) · **Space** brake (hold) · **+ / −** adjust the selected map cells.
@@ -121,8 +126,9 @@ A pushed version tag (`v*`) publishes the same build under
 Polish user guide with a 10-minute demo scenario: [`docs/INSTRUKCJA.md`](docs/INSTRUKCJA.md).
 
 * **Windows 10/11:** no extra dependencies (OpenGL 2+ driver).
-* **Linux:** an OpenGL driver (Mesa) and, on X11, `libxkbcommon-x11`
-  (`sudo apt install libxkbcommon-x11-0 libgl1`); Wayland works out of the box.
+* **Linux:** an OpenGL driver (Mesa), ALSA for the engine sound and, on X11, `libxkbcommon-x11`
+  (`sudo apt install libxkbcommon-x11-0 libgl1 libasound2`); building from source also needs
+  `sudo apt install libasound2-dev pkg-config`. Without an audio device the app runs silently.
 
 ---
 

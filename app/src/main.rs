@@ -10,9 +10,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod autopsy;
+mod course;
 mod dyno;
 mod history;
+mod mapfile;
 mod maps;
 mod text;
 mod widgets;

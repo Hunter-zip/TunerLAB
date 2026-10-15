@@ -8,6 +8,7 @@ use eframe::egui::{
 use tunerlab_core::engine_sim::calibration::Table2D;
 use tunerlab_core::{Calibration, EngineSim, Language};
 
+use crate::mapfile::MapFiles;
 use crate::text::{cells, tr, T};
 use crate::widgets::{heat, palette::*};
 
@@ -188,6 +189,8 @@ pub struct MapEditor {
     set_value: f32,
     /// The last edit was rejected by the calibration validator.
     rejected: bool,
+    /// Saving and loading map files.
+    files: MapFiles,
 }
 
 impl Default for MapEditor {
@@ -198,6 +201,7 @@ impl Default for MapEditor {
             step: MapKind::Ve.default_step(),
             set_value: 0.0,
             rejected: false,
+            files: MapFiles::default(),
         }
     }
 }
@@ -226,7 +230,7 @@ impl MapEditor {
             self.select_kind(MapKind::Ve);
         }
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(tr(T::Table, lang)).color(DIM));
+            ui.label(RichText::new(tr(T::Table, lang)).color(pal().dim));
             let mut kinds = vec![MapKind::Ve, MapKind::Ignition, MapKind::Lambda];
             if turbo {
                 kinds.push(MapKind::Boost);
@@ -241,7 +245,16 @@ impl MapEditor {
                 }
             }
         });
-        ui.label(RichText::new(tr(T::MapHelp, lang)).color(DIM).size(12.0));
+        ui.label(
+            RichText::new(tr(T::MapHelp, lang))
+                .color(pal().dim)
+                .size(12.0),
+        );
+        if self.files.show(ui, sim, lang) {
+            // The loaded tables replace what the selection pointed at.
+            self.selection = None;
+            self.rejected = false;
+        }
         ui.add_space(4.0);
 
         let kind = self.kind;
@@ -302,7 +315,7 @@ impl MapEditor {
                     tr(T::CalibrationRejected, lang),
                     tr(T::ValueOutOfRange, lang),
                 ))
-                .color(DANGER),
+                .color(pal().danger),
             );
         }
         ui.label(
@@ -320,7 +333,7 @@ impl MapEditor {
                     lang
                 ),
             ))
-            .color(CYAN),
+            .color(pal().cyan),
         );
 
         // Keyboard step editing (not while a number is being typed).
@@ -420,27 +433,27 @@ impl MapEditor {
             Align2::RIGHT_TOP,
             tr(T::AxisRpm, lang),
             FontId::proportional(9.0),
-            DIM,
+            pal().dim,
         );
         p.text(
             origin + Vec2::new(3.0, header_h - 1.0),
             Align2::LEFT_BOTTOM,
             tr(kind.y_axis_label(), lang),
             FontId::proportional(9.0),
-            DIM,
+            pal().dim,
         );
         for (x, v) in view.x.iter().enumerate() {
             let r = Rect::from_min_size(
                 origin + Vec2::new(header_w + cell_w * x as f32, 0.0),
                 Vec2::new(cell_w, header_h),
             );
-            p.rect_filled(r.shrink(0.5), CornerRadius::ZERO, PANEL);
+            p.rect_filled(r.shrink(0.5), CornerRadius::ZERO, pal().panel);
             p.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 format!("{v:.0}"),
                 font.clone(),
-                TEXT,
+                pal().text,
             );
         }
         for (y, v) in view.y.iter().enumerate() {
@@ -448,13 +461,13 @@ impl MapEditor {
                 origin + Vec2::new(0.0, header_h + cell_h * y as f32),
                 Vec2::new(header_w, cell_h),
             );
-            p.rect_filled(r.shrink(0.5), CornerRadius::ZERO, PANEL);
+            p.rect_filled(r.shrink(0.5), CornerRadius::ZERO, pal().panel);
             p.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 format!("{v:.0}"),
                 font.clone(),
-                TEXT,
+                pal().text,
             );
         }
         for y in 0..ny {
@@ -492,7 +505,7 @@ impl MapEditor {
                 header_h + cell_h * (op.1 + 0.5),
             );
         p.circle_stroke(c, 7.0, Stroke::new(2.5, Color32::WHITE));
-        p.circle_filled(c, 3.0, ACCENT);
+        p.circle_filled(c, 3.0, pal().accent);
     }
 }
 

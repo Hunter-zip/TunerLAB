@@ -726,6 +726,10 @@ fn engine_autopsy_faults_leave_their_signatures() {
 fn warnings_and_events_do_not_depend_on_frame_rate() {
     let record = |frame: f32| {
         let mut sim = warm_na(36);
+        // A raised limiter lets the engine over-rev, so the run logs warnings.
+        let redline = sim.spec().limits.redline_rpm;
+        sim.update_calibration(|c| c.limiter.cut_rpm = redline + 900.0)
+            .unwrap();
         sim.update_controls(|c| c.pedal = 1.0);
         let frames = (3.0 / frame).round() as usize;
         for _ in 0..frames {
@@ -1847,5 +1851,65 @@ fn healthy_turbo_shows_no_rich_mixture_through_fuel_cuts() {
     assert!(
         rich * 50 < frames,
         "rich in {rich} of {frames} frames on the limiter"
+    );
+}
+
+/// Frames out of `seconds` in which `warning` is shown.
+fn frames_with(sim: &mut EngineSim, seconds: f32, warning: Warning) -> usize {
+    let mut n = 0;
+    for _ in 0..(seconds / FRAME) as usize {
+        sim.tick(FRAME);
+        if sim.telemetry().warnings.contains(warning) {
+            n += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn the_stock_limiter_raises_no_over_rev_but_a_raised_one_does() {
+    let mut sim = warm_na(81);
+    sim.update_controls(|c| c.pedal = 1.0);
+    let on_limiter = frames_with(&mut sim, 6.0, Warning::OverRev);
+    assert_eq!(on_limiter, 0, "over-rev on the factory limiter");
+    let redline = sim.spec().limits.redline_rpm;
+    sim.update_calibration(|c| c.limiter.cut_rpm = redline + 900.0)
+        .unwrap();
+    let raised = frames_with(&mut sim, 6.0, Warning::OverRev);
+    assert!(raised > 60, "over-rev beyond the band in {raised} frames");
+}
+
+#[test]
+fn lifting_off_at_high_speed_does_not_flag_a_rich_mixture() {
+    // Free rev on the limiter, then a snap lift-off.
+    let mut sim = warm_na(82);
+    sim.update_controls(|c| c.pedal = 1.0);
+    run(&mut sim, 3.0);
+    sim.update_controls(|c| c.pedal = 0.0);
+    let free = frames_with(&mut sim, 6.0, Warning::RichMixture);
+    assert_eq!(free, 0, "rich after a free-rev lift-off");
+    // Deep overrun: the absorber drives the engine at 6000 rpm with the throttle shut.
+    dyno(&mut sim, 6000.0, 1.0);
+    run(&mut sim, 4.0);
+    dyno(&mut sim, 6000.0, 0.0);
+    let overrun = frames_with(&mut sim, 6.0, Warning::RichMixture);
+    assert_eq!(overrun, 0, "rich on closed-throttle overrun");
+}
+
+#[test]
+fn a_sustained_rich_mixture_is_still_flagged() {
+    let mut sim = warm_na(83);
+    sim.update_calibration(|c| {
+        for row in c.lambda_target.values.iter_mut() {
+            row.fill(0.66);
+        }
+    })
+    .unwrap();
+    dyno(&mut sim, 3000.0, 1.0);
+    run(&mut sim, 3.0);
+    let rich = frames_with(&mut sim, 4.0, Warning::RichMixture);
+    assert!(
+        rich > 200,
+        "λ 0.66 at full load flagged in {rich} of 240 frames"
     );
 }
